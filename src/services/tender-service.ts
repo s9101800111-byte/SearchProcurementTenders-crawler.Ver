@@ -1,37 +1,55 @@
 import { WebCrawlerService } from './web-crawler.js';
-import { SearchParams, Tender } from '../types/tender.js';
-import { parseROCDate, getRemainingDays, calculateTenderPeriod } from '../utils/date.js';
+import { DateFilter, SearchParams, Tender } from '../types/tender.js';
+import { parseROCDate, getRemainingDays, calculateTenderPeriod, rocStringToNumber } from '../utils/date.js';
 
 export class TenderService {
   private crawler = new WebCrawlerService();
 
   /**
    * 標案查詢：僅使用 Web Crawler 確保資料最即時且直接來自官網
+   * 日期區間在本地過濾（官網 dateType=isDate 實測無法使用，見 web-crawler.search 註解）
    */
-  async fetchAndFilterTenders(keyword: string) {
+  async fetchAndFilterTenders(keyword: string, filter: DateFilter = {}) {
     try {
-      console.log(`[Crawler] 正在從政府採購網查詢: ${keyword}`);
-      
-      const crawlerParams: SearchParams = {
-        tenderName: keyword,
-        startDate: '',
-        endDate: ''
-      };
+      // stdio MCP 的 stdout 是 JSON-RPC 通道，log 一律走 stderr
+      console.error(`[Crawler] 正在從政府採購網查詢: ${keyword}`);
 
-      const webResults = await this.crawler.search(crawlerParams);
-      
-      const results = webResults.map(t => this.formatTender(t));
+      const crawlerParams: SearchParams = { tenderName: keyword };
 
-      return { 
-        results, 
-        hasMore: false, 
-        source: 'web' 
+      const { tenders, truncated } = await this.crawler.search(crawlerParams);
+      const matched = tenders.filter(t => this.matchesDateFilter(t, filter));
+
+      const results = matched.map(t => this.formatTender(t));
+
+      return {
+        results,
+        totalBeforeFilter: tenders.length,
+        hasMore: truncated,
+        source: 'web'
       };
 
     } catch (error: any) {
       console.error(`[Crawler Error] 查詢失敗: ${error.message}`);
       throw new Error(`無法從政府採購網取得資料: ${error.message}`);
     }
+  }
+
+  /**
+   * 公告日期與截止投標日各自套用區間；未給的條件視為不限。
+   * 日期解析不出來的案子一律保留，寧可多給也不要誤刪。
+   */
+  private matchesDateFilter(t: Tender, f: DateFilter): boolean {
+    const inRange = (dateStr: string, from?: number | null, to?: number | null) => {
+      if (from == null && to == null) return true;
+      const n = rocStringToNumber(dateStr);
+      if (n == null) return true;
+      if (from != null && n < from) return false;
+      if (to != null && n > to) return false;
+      return true;
+    };
+
+    return inRange(t.publishDate, f.publishFrom, f.publishTo)
+      && inRange(t.endDate, f.deadlineFrom, f.deadlineTo);
   }
 
   /**
@@ -70,4 +88,5 @@ export class TenderService {
 
 // 導出實例
 const service = new TenderService();
-export const fetchAndFilterTenders = (keyword: string) => service.fetchAndFilterTenders(keyword);
+export const fetchAndFilterTenders = (keyword: string, filter?: DateFilter) =>
+  service.fetchAndFilterTenders(keyword, filter);

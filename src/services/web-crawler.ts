@@ -14,32 +14,74 @@ export class WebCrawlerService {
     'Pragma': 'no-cache'
   };
 
-  async search(params: SearchParams): Promise<Tender[]> {
-    const urlParams = new URLSearchParams({
-      pageSize: '50',
-      firstSearch: 'true',
-      searchType: 'basic',
-      isBinding: 'N',
-      isLogIn: 'N',
-      level_1: 'on',
-      tenderName: params.tenderName,
-      tenderType: params.tenderType || 'TENDER_DECLARATION',
-      tenderWay: params.tenderWay || 'TENDER_WAY_ALL_DECLARATION',
-      dateType: 'isSpdt',
-    });
+  /**
+   * 依關鍵字抓取「等標期內」標案，自動翻頁直到抓完或達 maxPages 上限。
+   *
+   * 註：政府採購網的 dateType=isDate（公告日期區間）實測一律回「無符合條件資料」，
+   * 連用網站自己的送出程式在瀏覽器操作也一樣，因此日期區間改由本專案在結果上自行過濾。
+   */
+  async search(params: SearchParams): Promise<{ tenders: Tender[]; truncated: boolean }> {
+    const pageSize = params.pageSize ?? 100; // 官網上限 100
+    const maxPages = params.maxPages ?? 5;
 
-    const fullUrl = `${this.baseUrl}?${urlParams.toString()}`;
+    const all: Tender[] = [];
+    const seen = new Set<string>();
+    let pageParam = ''; // displaytag 的翻頁參數名，例如 d-49738-p
+    let truncated = false;
 
+    for (let page = 1; page <= maxPages; page++) {
+      if (page > 1 && !pageParam) break; // 找不到翻頁參數就只取第一頁
+
+      const urlParams = new URLSearchParams({
+        pageSize: String(pageSize),
+        firstSearch: 'true',
+        searchType: 'basic',
+        isBinding: 'N',
+        isLogIn: 'N',
+        level_1: 'on',
+        tenderName: params.tenderName,
+        tenderType: params.tenderType || 'TENDER_DECLARATION',
+        tenderWay: params.tenderWay || 'TENDER_WAY_ALL_DECLARATION',
+        dateType: 'isSpdt',
+      });
+      if (page > 1) urlParams.set(pageParam, String(page));
+
+      const html = await this.fetchHtml(`${this.baseUrl}?${urlParams.toString()}`);
+      // 分頁連結在 HTML 裡是 &amp; 編碼過的，別用 [?&] 當前綴去比對
+      if (!pageParam) pageParam = html.match(/(d-\d+-p)=/)?.[1] ?? '';
+
+      const rows = this.parseRows(html);
+      const fresh = rows.filter(t => !seen.has(t.id));
+      fresh.forEach(t => seen.add(t.id));
+      all.push(...fresh);
+
+      // 這一頁沒滿或沒有新資料，表示已到最後一頁
+      if (rows.length < pageSize || fresh.length === 0) break;
+
+      // 還有下一頁卻已用完頁數配額，標記為截斷，不要假裝抓完了
+      if (page === maxPages) truncated = true;
+    }
+
+    return { tenders: all, truncated };
+  }
+
+  private async fetchHtml(fullUrl: string): Promise<string> {
     try {
       const response = await axios.get(fullUrl, {
         headers: this.defaultHeaders,
         responseType: 'arraybuffer',
-        timeout: 15000
+        timeout: 20000
       });
+      return this.decodeHtml(response.data, response.headers['content-type']);
+    } catch (error: any) {
+      console.error('Web Crawler Error:', error);
+      throw new Error(`網頁抓取失敗: ${error.message}`);
+    }
+  }
 
-      const html = this.decodeHtml(response.data, response.headers['content-type']);
-      const $ = cheerio.load(html);
-      const tenders: Tender[] = [];
+  private parseRows(html: string): Tender[] {
+    const $ = cheerio.load(html);
+    const tenders: Tender[] = [];
 
       $('table tr').each((_, el) => {
         const cols = $(el).find('td');
@@ -79,12 +121,7 @@ export class WebCrawlerService {
         }
       });
 
-      return tenders;
-
-    } catch (error: any) {
-      console.error('Web Crawler Error:', error);
-      throw new Error(`網頁抓取失敗: ${error.message}`);
-    }
+    return tenders;
   }
 
   private decodeHtml(data: Buffer, contentType?: string): string {
