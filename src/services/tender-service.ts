@@ -9,12 +9,12 @@ export class TenderService {
    * 標案查詢：僅使用 Web Crawler 確保資料最即時且直接來自官網
    * 日期區間在本地過濾（官網 dateType=isDate 實測無法使用，見 web-crawler.search 註解）
    */
-  async fetchAndFilterTenders(keyword: string, filter: DateFilter = {}) {
+  async fetchAndFilterTenders(keyword: string, filter: DateFilter = {}, orgName?: string) {
     try {
       // stdio MCP 的 stdout 是 JSON-RPC 通道，log 一律走 stderr
-      console.error(`[Crawler] 正在從政府採購網查詢: ${keyword}`);
+      console.error(`[Crawler] 正在從政府採購網查詢: 標案名稱=${keyword || '(未給)'} 機關=${orgName || '(未給)'}`);
 
-      const crawlerParams: SearchParams = { tenderName: keyword };
+      const crawlerParams: SearchParams = { tenderName: keyword, orgName };
 
       const { tenders, truncated } = await this.crawler.search(crawlerParams);
       const matched = tenders.filter(t => this.matchesDateFilter(t, filter));
@@ -88,5 +88,5 @@ export class TenderService {
 
 // 導出實例
 const service = new TenderService();
-export const fetchAndFilterTenders = (keyword: string, filter?: DateFilter) =>
-  service.fetchAndFilterTenders(keyword, filter);
+export const fetchAndFilterTenders = (keyword: string, filter?: DateFilter, orgName?: string) =>
+  service.fetchAndFilterTenders(keyword, filter, orgName);

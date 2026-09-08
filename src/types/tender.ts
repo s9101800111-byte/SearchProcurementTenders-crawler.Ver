@@ -29,6 +29,8 @@ export interface Tender {
 
 export interface SearchParams {
   tenderName: string;
+  /** 機關名稱，官網欄位 orgName，部分比對（「空軍」可命中「國防部空軍司令部」） */
+  orgName?: string;
   tenderType?: string;
   tenderWay?: string;
   /** 單頁筆數，政府採購網最大可接受 100 */
@@ -67,4 +69,41 @@ export interface DateFilter {
   deadlineFrom?: number | null;
   /** 截止投標日迄 */
   deadlineTo?: number | null;
+}
+
+/** 全文檢索可查的公報種類（官網 tenderStatusType 欄位值） */
+export type TenderStatusType = '招標' | '決標' | '公開閱覽及公開徵求' | '政府採購預告';
+
+/** 全文檢索（電子公報）的一筆公報紀錄，含已截止的歷史案 */
+export interface ArchiveTender {
+  /** 去重用的鍵（優先用內頁連結） */
+  key: string;
+  /** 種類：招標公告 / 決標公告 / 無法決標公告 / 更正公告… */
+  kind: string;
+  /** 機關名稱 */
+  orgName: string;
+  /** 標案案號 */
+  caseId: string;
+  /** 標案名稱（藏在 pageCode2Img 的 JS 裡，已抽出） */
+  name: string;
+  /** 招標公告日期 */
+  publishDate: string;
+  /** 決標或無法決標公告日期 */
+  awardDate: string;
+  /** 截止投標日期 */
+  endDate: string;
+  /** 這筆是從哪個民國年度的公報查到的 */
+  year: number;
+  /** 標案內頁連結（tpam?pk=…，可直接餵 get_tender_detail） */
+  link: string;
+}
+
+export interface ArchiveSearchParams {
+  /** 全文查詢字串，支援 AND/OR/NOT 布林語法 */
+  querySentence: string;
+  /** 民國年，官網一次只吃一年 */
+  year: number;
+  statusTypes: TenderStatusType[];
+  /** true（預設）只比對機關名＋標案名；false 會比對公告全文，命中量暴增 */
+  matchNameOnly?: boolean;
 }

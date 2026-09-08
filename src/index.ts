@@ -4,24 +4,48 @@ import { z } from "zod";
 import { fetchAndFilterTenders } from "./services/tender-service.js";
 import { fetchTenderDetails, KEY_FIELDS, MAX_FETCH_PER_CALL } from "./services/detail-crawler.js";
 import { toROCNumber, formatROCNumber } from "./utils/date.js";
+import { searchArchive, parseYears, currentROCYear, MIN_ROC_YEAR, MAX_YEARS_PER_CALL } from "./services/archive-service.js";
+import { TenderStatusType } from "./types/tender.js";
 
 const server = new McpServer({
   name: "taiwan-tender-searcher",
-  version: "0.0.2",
+  version: "0.0.3",
+}, {
+  // 行為規則放 server instructions：任何 client 掛上這支 MCP 就生效，不依賴 skill 觸發或記憶命中
+  instructions: `查台灣政府採購標案的固定作法：
+
+1. 兩個查詢工具的涵蓋範圍**互不重疊**，不可互相取代：
+   - search_tenders：只有「等標期內」還能投標的案子（官網 dateType=isSpdt）
+   - search_tender_archive：全文檢索電子公報，民國 88 年起，**含已截止的歷史案**
+2. 使用者沒有明確限定範圍時，**兩個工具都要跑**，並把結果分成兩段回報：
+   「等標期內（還能投標）」與「已截止／歷史案（僅供參考，不能投標）」。
+   每段都要標明筆數；某段是 0 筆也要明寫「0 筆」，**不可靜默省略**（省略會被誤讀成沒查過）。
+3. 只有使用者明講「只要現在能投的」才可以只跑 search_tenders。
+   反之，使用者問的案子查不到時，要先確認是不是已截止、改用 search_tender_archive 再答，
+   不要把「工具查不到」講成「這個案子不存在」。
+4. 判斷案子性質與可投性，用 get_tender_detail 看「標的分類」與「廠商資格摘要」兩個欄位，
+   不要只靠標案名稱關鍵字（分類碼比關鍵字可靠，但資格摘要才決定誰能投）。
+5. get_tender_detail 受網站流量控制，一次最多 8 筆未快取的案子。遇到驗證碼頁就附連結
+   請使用者人工開啟，**不要重試迴圈，也不要試圖繞過驗證碼**。`,
 });
 
 server.tool(
   "search_tenders",
-  "Search for Taiwan government procurement tenders (web.pcc.gov.tw), optionally narrowed by an announcement-date range (publishFrom/publishTo) and/or a bid-deadline range (deadlineFrom/deadlineTo). Scope is limited to tenders still open for bidding (等標期內); closed/historical tenders are not covered. This tool returns a pre-formatted Markdown table. The LLM MUST output this table verbatim to the user without modifying its format, columns, or content.",
+  "Search for Taiwan government procurement tenders (web.pcc.gov.tw), optionally narrowed by an announcement-date range (publishFrom/publishTo) and/or a bid-deadline range (deadlineFrom/deadlineTo). Can also search by procuring agency name (orgName, partial match: '空軍' matches '國防部空軍司令部'). At least one of keyword / orgName is required; giving both narrows to tenders matching name AND agency. Note the agency is the one that PUBLISHES the tender, which is often NOT the unit named as the construction site. Scope is limited to tenders still open for bidding (等標期內); closed/historical tenders are not covered. This tool returns a pre-formatted Markdown table. The LLM MUST output this table verbatim to the user without modifying its format, columns, or content.",
   {
-    keyword: z.string().describe("Search keyword (e.g., 'indoor renovation', 'construction project')"),
+    keyword: z.string().optional().describe("Tender-NAME keyword (e.g., 'indoor renovation'). Matches the tender name only - not the case number, not the agency."),
+    orgName: z.string().optional().describe("機關名稱，部分比對（例：空軍、國防部空軍司令部）。keyword 與 orgName 至少要給一個。"),
     publishFrom: z.string().optional().describe("公告日期起 (民國或西元皆可：115/07/01、1150701、2026-07-01)"),
     publishTo: z.string().optional().describe("公告日期迄 (同上格式)"),
     deadlineFrom: z.string().optional().describe("截止投標日起 (同上格式)"),
     deadlineTo: z.string().optional().describe("截止投標日迄 (同上格式)"),
   },
-  async ({ keyword, publishFrom, publishTo, deadlineFrom, deadlineTo }) => {
+  async ({ keyword, orgName, publishFrom, publishTo, deadlineFrom, deadlineTo }) => {
     try {
+      if (!keyword && !orgName) {
+        return { content: [{ type: "text", text: "請至少給 keyword（標案名稱關鍵字）或 orgName（機關名稱）其中一個。" }] };
+      }
+      const label = [keyword && `「${keyword}」`, orgName && `機關「${orgName}」`].filter(Boolean).join('＋');
       const raw = { publishFrom, publishTo, deadlineFrom, deadlineTo };
       const filter = {
         publishFrom: toROCNumber(publishFrom),
@@ -44,15 +68,15 @@ server.tool(
         range(filter.deadlineFrom, filter.deadlineTo) && `截止投標 ${range(filter.deadlineFrom, filter.deadlineTo)}`,
       ].filter(Boolean).join('｜');
 
-      const { results, totalBeforeFilter, hasMore } = await fetchAndFilterTenders(keyword, filter);
+      const { results, totalBeforeFilter, hasMore } = await fetchAndFilterTenders(keyword ?? '', filter, orgName);
 
       if (results.length === 0) {
         const suffix = conditions ? `（條件：${conditions}；等標期內共掃描 ${totalBeforeFilter} 筆）` : '';
-        return { content: [{ type: "text", text: `找不到與「${keyword}」相關且可投標的案件。${suffix}` }] };
+        return { content: [{ type: "text", text: `找不到與 ${label} 相關且可投標的案件。${suffix}` }] };
       }
 
       // 格式化為高品質 Markdown 表格
-      let markdownTable = `### 「${keyword}」標案搜尋結果 (共 ${results.length} 筆)\n\n`;
+      let markdownTable = `### ${label} 標案搜尋結果 (共 ${results.length} 筆)\n\n`;
       if (conditions) {
         markdownTable += `> 篩選條件：${conditions}　(等標期內共 ${totalBeforeFilter} 筆，符合 ${results.length} 筆)\n\n`;
       }
@@ -66,7 +90,7 @@ server.tool(
       });
 
       if (results.length === 0) {
-        markdownTable = `### 「${keyword}」搜尋結果\n\n目前沒有搜尋到相關標案。`;
+        markdownTable = `### ${label} 搜尋結果\n\n目前沒有搜尋到相關標案。`;
       } else if (hasMore) {
         markdownTable += `\n> *註：關鍵字命中數超過抓取上限（500 筆），結果可能不完整，請縮小關鍵字或加上日期條件。*\n`;
       }
@@ -141,6 +165,83 @@ server.tool(
       return { content: [{ type: "text", text: out }] };
     } catch (error: any) {
       return { content: [{ type: "text", text: `取得標案明細失敗: ${error.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  "search_tender_archive",
+  `Search the FULL-TEXT bulletin archive (電子公報全文檢索) of web.pcc.gov.tw. This is the ONLY way to find tenders whose bidding period has already CLOSED — search_tenders covers ONLY tenders still open for bidding (等標期內). Covers ROC years ${MIN_ROC_YEAR} to ${currentROCYear()}; the site accepts one year per request, so this tool queries at most ${MAX_YEARS_PER_CALL} years per call. Returns 種類 (招標公告 / 決標公告 / 無法決標公告), 機關名稱, 標案案號, 標案名稱, 招標公告日期, 截止投標日期, plus a detail link whose pk can be passed straight to get_tender_detail. Results are split into 等標期內 (still open) and 已截止／歷史 (closed) sections. Each year returns at most the 100 most recent matches (the site caps one response at 100 rows and its pagination needs a real browser session), and the output states the site-wide hit count whenever it is larger — narrow with a 標案案號, a tighter keyword, or one year per call instead of expecting more rows. Unless the user explicitly asked only for tenders they can still bid on, run this tool ALONGSIDE search_tenders and report both sections with their counts — write "0 筆" explicitly for an empty section instead of omitting it. This tool returns pre-formatted Markdown; output it verbatim without changing its structure.`,
+  {
+    keyword: z.string().min(1).describe("全文查詢字串。支援布林語法：AND（或 , &）、OR（或 ; |）、NOT（或 !）與括號；含保留字請用雙引號包住。也可直接放標案案號。"),
+    years: z.string().optional().describe(`民國年度，官網一次只吃一年，本工具一次最多 ${MAX_YEARS_PER_CALL} 年。可寫 115、114,115、113-115。預設當年（${currentROCYear()}），範圍 ${MIN_ROC_YEAR}~${currentROCYear()}。`),
+    statusTypes: z.array(z.enum(["招標", "決標", "公開閱覽及公開徵求", "政府採購預告"])).optional().describe("公報種類，預設 ['招標']。要查決標結果或無法決標請加 '決標'。"),
+    publishFrom: z.string().optional().describe("招標公告日期起 (民國或西元皆可：115/07/01、1150701、2026-07-01)"),
+    publishTo: z.string().optional().describe("招標公告日期迄 (同上格式)"),
+    deadlineFrom: z.string().optional().describe("截止投標日起 (同上格式)"),
+    deadlineTo: z.string().optional().describe("截止投標日迄 (同上格式)"),
+    fullText: z.boolean().optional().describe("預設 false＝只比對機關名稱與標案名稱。true 會比對公告全文，命中數暴增，只在窄關鍵字時用。"),
+  },
+  async ({ keyword, years, statusTypes, publishFrom, publishTo, deadlineFrom, deadlineTo, fullText }) => {
+    try {
+      const { years: yearList, invalid } = parseYears(years);
+      if (invalid.length > 0) {
+        return { content: [{ type: "text", text: `年度無法解析或超出範圍（${MIN_ROC_YEAR}~${currentROCYear()}）：${invalid.join('、')}。請用民國年，例如 115 或 113-115。` }] };
+      }
+      if (yearList.length > MAX_YEARS_PER_CALL) {
+        return { content: [{ type: "text", text: `一次最多查 ${MAX_YEARS_PER_CALL} 個年度（本次給了 ${yearList.length} 個：${yearList.join('、')}），請分批查詢。` }] };
+      }
+
+      const raw = { publishFrom, publishTo, deadlineFrom, deadlineTo };
+      const filter = {
+        publishFrom: toROCNumber(publishFrom),
+        publishTo: toROCNumber(publishTo),
+        deadlineFrom: toROCNumber(deadlineFrom),
+        deadlineTo: toROCNumber(deadlineTo),
+      };
+      // 有給日期卻解析不出來，直接告訴使用者，不要默默當成不限
+      const bad = (Object.keys(raw) as (keyof typeof raw)[]).filter(k => raw[k] && filter[k] == null);
+      if (bad.length > 0) {
+        return { content: [{ type: "text", text: `日期格式無法解析：${bad.map(k => `${k}="${raw[k]}"`).join('、')}。請用 115/07/01 或 2026-07-01 這類格式。` }] };
+      }
+
+      const kinds = (statusTypes ?? ["招標"]) as TenderStatusType[];
+      const { results, scanned, siteTotal, truncated } = await searchArchive(
+        keyword, yearList, kinds, filter, { matchNameOnly: !fullText }
+      );
+
+      const scope = `${yearList.join('、')} 年度公報｜種類 ${kinds.join('、')}｜${fullText ? '全文比對' : '只比對機關名與標案名'}`;
+      if (results.length === 0) {
+        return { content: [{ type: "text", text: `### 全文檢索「${keyword}」：0 筆\n\n> 範圍：${scope}\n> 官網該關鍵字命中 ${siteTotal} 筆，本次掃描 ${scanned} 筆，套用日期條件後 0 筆。\n\n查不到不代表案子不存在——可放寬年度、改用標案案號當關鍵字，或加 fullText=true 比對公告全文。` }] };
+      }
+
+      const open = results.filter(r => !r.closed);
+      const closed = results.filter(r => r.closed);
+
+      const table = (rows: typeof results) => {
+        let t = `| 種類 | 機關 | 案號 | 標案名稱 | 公告日 | 截止投標 | 狀態 | 連結 |\n`;
+        t += `| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n`;
+        rows.forEach(r => {
+          const title = r.title.length > 35 ? r.title.slice(0, 33) + '...' : r.title;
+          t += `| ${r.kind} | ${r.orgName} | **${r.caseId}** | ${title} | ${r.publishDate} | ${r.deadline || '-'} | ${r.status} | ${r.link ? `[查看](${r.link})` : '-'} |\n`;
+        });
+        return t;
+      };
+
+      let out = `### 全文檢索「${keyword}」（共 ${results.length} 筆）\n\n> 範圍：${scope}\n\n`;
+      out += `#### 等標期內（還能投標）：${open.length} 筆\n\n`;
+      out += open.length > 0 ? table(open) + '\n' : `（0 筆）\n\n`;
+      out += `#### 已截止／歷史案（僅供參考，不能投標）：${closed.length} 筆\n\n`;
+      out += closed.length > 0 ? table(closed) + '\n' : `（0 筆）\n\n`;
+      out += `> 官網該關鍵字命中 ${siteTotal} 筆，本次掃描 ${scanned} 筆，套用條件後 ${results.length} 筆。\n`;
+      if (truncated) {
+        out += `> **註：官網命中 ${siteTotal} 筆，但單次只取得最新 100 筆／年度（官網分頁需瀏覽器 session、pageSize 硬上限 100），結果不完整。請縮小條件：改用標案案號、更精準的關鍵字，或逐年分開查。**\n`;
+      }
+      out += `> 「查看」連結可直接餵給 get_tender_detail 取標的分類與廠商資格（一次最多 8 筆）。\n`;
+
+      return { content: [{ type: "text", text: out }] };
+    } catch (error: any) {
+      return { content: [{ type: "text", text: `全文檢索失敗: ${error.message}` }] };
     }
   }
 );

@@ -40,6 +40,7 @@ export class WebCrawlerService {
         isLogIn: 'N',
         level_1: 'on',
         tenderName: params.tenderName,
+        orgName: params.orgName ?? '',
         tenderType: params.tenderType || 'TENDER_DECLARATION',
         tenderWay: params.tenderWay || 'TENDER_WAY_ALL_DECLARATION',
         dateType: 'isSpdt',
