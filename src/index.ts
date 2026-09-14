@@ -6,6 +6,12 @@ import { fetchTenderDetails, KEY_FIELDS, MAX_FETCH_PER_CALL } from "./services/d
 import { toROCNumber, formatROCNumber } from "./utils/date.js";
 import { searchArchive, parseYears, currentROCYear, MIN_ROC_YEAR, MAX_YEARS_PER_CALL } from "./services/archive-service.js";
 import { TenderStatusType } from "./types/tender.js";
+import {
+  queryAwardsByLocations, exportAwards, isValidRocNumber, rocNumberToWestern, todayRocNumber, rocDaysBetween,
+  AWARD_DATA_START_ROC, MAX_RANGE_DAYS,
+} from "./services/award-service.js";
+import { resolveCounties, listCounties, OTHER_LOCATION_CODE } from "./services/award-locations.js";
+import { ExecLocationOption } from "./types/award.js";
 
 const server = new McpServer({
   name: "taiwan-tender-searcher",
@@ -26,7 +32,9 @@ const server = new McpServer({
 4. 判斷案子性質與可投性，用 get_tender_detail 看「標的分類」與「廠商資格摘要」兩個欄位，
    不要只靠標案名稱關鍵字（分類碼比關鍵字可靠，但資格摘要才決定誰能投）。
 5. get_tender_detail 受網站流量控制，一次最多 8 筆未快取的案子。遇到驗證碼頁就附連結
-   請使用者人工開啟，**不要重試迴圈，也不要試圖繞過驗證碼**。`,
+   請使用者人工開啟，**不要重試迴圈，也不要試圖繞過驗證碼**。
+6. 查「已決標」案件（某期間／某縣市／某分類的決標案、決標金額）一律用 search_awards，
+   **不要用 search_tender_archive 篩決標日期**——archive 的公告日是招標公告日，會篩錯。`,
 });
 
 server.tool(
@@ -242,6 +250,167 @@ server.tool(
       return { content: [{ type: "text", text: out }] };
     } catch (error: any) {
       return { content: [{ type: "text", text: `全文檢索失敗: ${error.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  "search_awards",
+  `Query AWARDED cases (決標公告) from web.pcc.gov.tw's award-query endpoint (決標查詢 readTenderAgent). Use this — NOT search_tender_archive — for any question about awards in a period (決標案件、決標金額、某期間某縣市的決標): search_tender_archive's date is the 招標公告日 and gives wrong answers for award dates. Server-side filters verified to work: 決標公告日 range (from/to), 標的分類 (category), 履約地點 (counties — status 決標 only, see limit 5; each county auto-expands to ALL of its site codes, including the separate 原住民地區 codes and legacy pre-merger county codes such as 臺中縣, queried one by one and merged/deduplicated by 機關＋案號＋決標公告序號), plus 機關名稱 / 標案名稱 partial match and status (決標／無法決標／撤銷). Auto-paginates (100 rows/page, ≥1.5 s between requests; the listing endpoint has no CAPTCHA rate limit, detail pages are never opened). The summary reports, for every site code, 官網共有 N 筆 vs 實抓 M 筆, the total, the sum of 決標金額 and the number of correction notices, and states explicitly when maxRows truncated the result. Site limits: data only from 112/07/01 onward; one call's date range may not exceed ${MAX_RANGE_DAYS} days. The listing has NO winning-vendor column. When there are more rows than previewRows, ALL rows are written to CSV (UTF-8 with BOM, Chinese headers) and JSON under the project's .cache/exports/ and both absolute paths are returned. SEMANTIC LIMITS — tell the user whenever they affect the answer: (1) 決標公告日 ≠ 決標日: the notice usually lags the award by 1~20 days, so the right end of a recent range is structurally UNDERCOUNTED (re-query around T+30 days for completeness). (2) 履約地點 is a coarse field self-reported by the agency; it is NOT necessarily the actual work site. (3) There is an 「其他」 bucket (EXECUTE_LOCATION_20000007): cases of agencies located in the requested counties are sometimes filed there — set includeOther=true to add it (the bucket is nationwide, so judge its rows by 機關名稱). (4) Rows flagged 更正公告 show the CORRECTION date, not the original award notice date (the original can be much earlier); the date filter matches original OR correction date. (5) The 履約地點 filter does NOT work for 無法決標 notices (measured 勞務 115/07/11~09/11: 3,960 nationwide vs 6 for 臺中市 and 0 for 雲林縣; 撤銷 results likewise lose their 無法決標 rows), so status 無法決標／撤銷 combined with counties is REJECTED — query nationwide without counties and narrow with orgName instead. This tool returns pre-formatted Markdown; output it verbatim without changing its structure.`,
+  {
+    from: z.string().describe("決標公告日起（必填）。民國或西元皆可：115/07/11、1150711、2026-07-11、2026/07/11"),
+    to: z.string().optional().describe("決標公告日迄（同上格式），預設今天"),
+    category: z.enum(["工程", "財物", "勞務"]).optional().describe("標的分類；不填＝全部"),
+    counties: z.array(z.string()).optional().describe("縣市名陣列，例 ['南投縣','臺中市']；台/臺皆可、可省略縣市字（有歧義如「新竹」會要求指明）。每個縣市自動展開成它全部的履約地點代碼（含原住民地區、舊制縣代碼）。不填＝全國。只能搭配 status=決標（官網履約地點篩選對無法決標公告無效）"),
+    includeOther: z.boolean().optional().describe("有給 counties 時是否加查履約地點「其他」桶（全國性），預設 false"),
+    orgName: z.string().optional().describe("機關名稱，部分比對"),
+    tenderName: z.string().optional().describe("標案名稱，部分比對"),
+    status: z.enum(["決標", "無法決標", "撤銷"]).optional().describe("標案狀態，預設 決標（決標公告）。無法決標／撤銷 不可搭配 counties，要縮小範圍請用 orgName"),
+    maxRows: z.number().int().min(1).max(3000).optional().describe("最多回傳幾列，預設 500，上限 3000"),
+    previewRows: z.number().int().min(0).max(500).optional().describe("回傳文字的表格只列前幾列，預設 50；結果多於此數時全部結果另存 CSV＋JSON"),
+  },
+  async ({ from, to, category, counties, includeOther, orgName, tenderName, status, maxRows, previewRows }) => {
+    const reply = (text: string) => ({ content: [{ type: "text" as const, text }] });
+    try {
+      const cap = maxRows ?? 500;
+      const preview = previewRows ?? 50;
+      const st = status ?? "決標";
+
+      // 有給日期卻解析不出來，直接告訴使用者，不要默默當成不限
+      const fromN = toROCNumber(from);
+      const toN = to ? toROCNumber(to) : todayRocNumber();
+      const bad = [
+        (fromN == null || !isValidRocNumber(fromN)) && `from="${from}"`,
+        (toN == null || !isValidRocNumber(toN)) && `to="${to}"`,
+      ].filter(Boolean);
+      if (bad.length > 0 || fromN == null || toN == null) {
+        return reply(`日期格式無法解析：${bad.join('、')}。請用 115/07/11 或 2026-07-11 這類格式（無法解析的日期不會被當成不限日期）。`);
+      }
+      if (fromN > toN) {
+        return reply(`決標公告日起 ${formatROCNumber(fromN)} 晚於迄 ${formatROCNumber(toN)}，請對調。`);
+      }
+      if (toN < AWARD_DATA_START_ROC) {
+        return reply(`官網決標查詢只提供 112/07/01 之後的資料，${formatROCNumber(fromN)} ~ ${formatROCNumber(toN)} 整段早於此，查不到。更早的決標案只能用 search_tender_archive 全文檢索（其日期是招標公告日）。`);
+      }
+      const notes: string[] = [];
+      let effFrom = fromN;
+      if (fromN < AWARD_DATA_START_ROC) {
+        effFrom = AWARD_DATA_START_ROC;
+        notes.push(`起日 ${formatROCNumber(fromN)} 早於官網資料下限 112/07/01，已改從 112/07/01 起查；更早的決標案此端點不提供。`);
+      }
+      const days = rocDaysBetween(effFrom, toN);
+      if (days > MAX_RANGE_DAYS) {
+        return reply(`決標公告日區間 ${formatROCNumber(effFrom)} ~ ${formatROCNumber(toN)} 相差 ${days} 天，超過官網未登入查詢上限 ${MAX_RANGE_DAYS} 天。請分段查詢；分段合併時更正公告可能在兩段各出現一次，要以 機關＋案號 去重。`);
+      }
+
+      let locations: ExecLocationOption[];
+      let scopeText: string;
+      if (counties && counties.some(c => c.trim())) {
+        // 官網履約地點篩選對無法決標公告（nonAtm）幾乎無效，照查會回嚴重偏低的筆數，寧可拒絕
+        if (st !== '決標') {
+          return reply(`status=${st} 不能搭配 counties：官網的「履約地點」篩選對無法決標公告幾乎無效（撤銷查詢裡的無法決標列也一樣），照查會得到嚴重偏低的筆數，不能當成該縣市的清單，所以本工具不接受這個組合。
+
+實測（勞務、115/07/11~09/11）：無法決標全國 3,960 筆，但履約地點＝臺中市只有 6 筆、雲林縣 0 筆，全國結果裡的「臺中市豐原區公所 11506B」不在臺中市代碼的結果中；撤銷查詢的決標公告列篩得到，無法決標列（例：新北市政府消防局、臺北市濱江實驗國民中學、國立土庫高級商工職業學校）在各自縣市代碼下都篩不到。
+
+改法：拿掉 counties 改查全國（官網總數才正確），用 orgName 以機關名稱縮小，例如 orgName="臺中市" 會命中臺中市政府各局處、區公所、市立學校；中央機關或國立學校在該縣市的案子不會命中，要另外用機關名查。結果超過 maxRows 時請縮短日期區間。`);
+        }
+        const { groups, invalid } = resolveCounties(counties);
+        if (invalid.length > 0) {
+          const why = invalid.map(i => i.candidates.length > 0 ? `「${i.input}」有歧義：${i.candidates.join('／')}` : `「${i.input}」`).join('；');
+          return reply(`縣市名無法辨識：${why}。可用縣市：${listCounties().join('、')}`);
+        }
+        locations = groups.flatMap(g => g.locations);
+        scopeText = groups.map(g => `${g.county}（${g.locations.length} 個代碼）`).join('、');
+        if (includeOther) {
+          locations.push({ code: OTHER_LOCATION_CODE, label: '其他' });
+          scopeText += '＋「其他」桶（全國性）';
+        }
+      } else {
+        locations = [{ code: '', label: '不限（全國）' }];
+        scopeText = '全國（不限）';
+        if (includeOther) notes.push('未指定 counties 時本來就是全國查詢（已含「其他」），includeOther 不另外查。');
+      }
+
+      const r = await queryAwardsByLocations(
+        { from: effFrom, to: toN, category, orgName, tenderName, status: st },
+        locations,
+        { maxRows: cap },
+      );
+
+      const fmt = (n: number) => n.toLocaleString('en-US');
+      const statusText = st === '決標' ? '決標公告' : st === '撤銷' ? '撤銷公告' : '無法決標';
+      const cond = [
+        `決標公告日 ${formatROCNumber(effFrom)} ~ ${formatROCNumber(toN)}（送出 ${rocNumberToWestern(effFrom)}~${rocNumberToWestern(toN)}）`,
+        `標的分類 ${category ?? '不限'}`,
+        `狀態 ${statusText}`,
+        `履約地點 ${scopeText}`,
+        orgName && `機關含「${orgName}」`,
+        tenderName && `標案名稱含「${tenderName}」`,
+      ].filter(Boolean).join('｜');
+
+      // 有代碼沒拿到官網總數時，加總只是下限
+      const siteTotalTxt = (r.siteTotalIsLowerBound ? '至少 ' : '') + fmt(r.siteTotal);
+      let out = `### 決標查詢：回傳 ${fmt(r.rows.length)} 筆（官網共有 ${siteTotalTxt} 筆）\n\n> 條件：${cond}\n\n`;
+      out += `#### 各履約地點代碼\n\n`;
+      for (const p of r.perLocation) {
+        const state = p.skipped ? '未查（前面已遭官網封鎖）'
+          : p.error ? `失敗：${p.error}`
+          : p.truncated ? '達 maxRows 截斷'
+          : p.fetched === p.siteTotal ? '完整' : '筆數不符';
+        out += `- ${p.label}（${p.code || '不限'}）：官網共有 ${p.siteTotal == null ? '?' : fmt(p.siteTotal)} 筆／實抓 ${fmt(p.fetched)} 筆｜${state}\n`;
+      }
+
+      const withAmount = r.rows.filter(x => x.amount != null);
+      const amountSum = withAmount.reduce((s, x) => s + (x.amount ?? 0), 0);
+      const corrections = r.rows.filter(x => x.isCorrection).length;
+      out += `\n#### 摘要\n\n`;
+      out += `- 總筆數：官網共有 ${siteTotalTxt} 筆；實抓 ${fmt(r.fetchedTotal)} 筆；合併去重後回傳 ${fmt(r.rows.length)} 筆`;
+      out += r.duplicates > 0 ? `（去除重複 ${r.duplicates} 筆，鍵＝機關＋案號＋決標公告序號）\n` : `\n`;
+      out += `- 決標金額合計：${fmt(amountSum)} 元（${fmt(withAmount.length)} 筆有金額；未公開／空白 ${fmt(r.rows.length - withAmount.length)} 筆不計）\n`;
+      out += `- 更正公告：${fmt(corrections)} 筆（這些列顯示的是更正日，不是原決標公告日）\n`;
+      if (r.truncated) {
+        out += `- **已截斷：官網共有 ${siteTotalTxt} 筆，maxRows=${cap}，實際只回傳 ${fmt(r.rows.length)} 筆。要完整結果請調高 maxRows（上限 3000）或縮小條件。**\n`;
+      }
+      if (r.hasError) {
+        out += `- **有代碼查詢失敗或未查，結果不完整（見上方各代碼狀態）。**\n`;
+      }
+      if (st === '撤銷') notes.push('撤銷公告列的日期欄可能是原公告日而非撤銷日（實測出現區間外日期）。');
+      notes.forEach(n => { out += `- ${n}\n`; });
+      out += `- 本次連線 ${r.requests} 次（僅清單端點，未開內頁）\n`;
+      out += `\n> 提醒：決標公告日 ≠ 決標日，公告通常落後 1～20 天，區間右端會低估｜履約地點是機關自填的粗欄位，不等於實際施作地｜有「其他」桶，本次${locations.some(l => l.code === OTHER_LOCATION_CODE || l.code === '') ? '已涵蓋' : '未查（可加 includeOther=true）'}｜清單沒有得標廠商欄位\n`;
+
+      if (r.rows.length > preview) {
+        try {
+          const { csvPath, jsonPath } = await exportAwards(r.rows, {
+            query: { from: formatROCNumber(effFrom), to: formatROCNumber(toN), category: category ?? null, status: st, counties: counties ?? null, includeOther: Boolean(includeOther), orgName: orgName ?? null, tenderName: tenderName ?? null, maxRows: cap },
+            perLocation: r.perLocation,
+            siteTotal: r.siteTotal,
+            truncated: r.truncated,
+          });
+          out += `\n**全部 ${fmt(r.rows.length)} 筆已匯出（下表只列前 ${preview} 筆）：**\n- CSV：${csvPath}\n- JSON：${jsonPath}\n`;
+        } catch (e: any) {
+          out += `\n**匯出檔寫入失敗：${e.message}**（下表只列前 ${preview} 筆，其餘沒有輸出）\n`;
+        }
+      }
+
+      if (r.rows.length === 0) {
+        out += `\n（0 筆）\n`;
+      } else if (preview > 0) {
+        const cellText = (s: string) => s.replace(/\|/g, '\\|');
+        out += `\n#### 前 ${Math.min(preview, r.rows.length)} 筆\n\n`;
+        out += `| 決標公告日 | 履約地點 | 機關 | 案號 | 標案名稱 | 招標方式 | 決標金額 | 更正 | 連結 |\n`;
+        out += `| :--- | :--- | :--- | :--- | :--- | :--- | ---: | :--- | :--- |\n`;
+        for (const x of r.rows.slice(0, preview)) {
+          const place = (locations.find(l => l.code === x.execLocation)?.label ?? '').replace('(非原住民地區)', '');
+          const title = x.tenderName.length > 35 ? x.tenderName.slice(0, 33) + '...' : x.tenderName;
+          const link = x.url ? `[${x.isNonAward ? '無法決標公告' : '決標公告'}](${x.url})` : '-';
+          out += `| ${x.awardNoticeDate} | ${place} | ${cellText(x.orgName)} | ${cellText(x.caseNo)} | ${cellText(title)} | ${x.tenderWay} | ${x.amount == null ? (x.isNonAward ? '-' : '未公開') : fmt(x.amount)} | ${x.isCorrection ? '更正' : ''} | ${link} |\n`;
+        }
+      }
+
+      return reply(out);
+    } catch (error: any) {
+      return reply(`決標查詢失敗: ${error.message}`);
     }
   }
 );
