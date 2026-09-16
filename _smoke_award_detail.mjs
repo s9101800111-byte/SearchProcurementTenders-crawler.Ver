@@ -949,14 +949,25 @@ ${td('投標廠商1', '')}${td('廠商代碼', '12345678')}${td('廠商名稱', 
   console.log('\n[8] git diff 檢查');
   {
     const git = (...args) => execFileSync('git', args, { cwd: ROOT, encoding: 'utf8' });
-    const diff = git('diff', 'HEAD', '--unified=0', '--', 'src/index.ts');
-    const removed = diff.split('\n').filter(l => l.startsWith('-') && !l.startsWith('---')).map(l => l.slice(1));
-    const added = diff.split('\n').filter(l => l.startsWith('+') && !l.startsWith('+++')).map(l => l.slice(1));
-    // 唯一允許被改的舊行是 instructions 第 6 條結尾（反引號移到新的第 7 條後面）
-    const okRemoved = removed.every(l => l.endsWith('`,') && added.includes(l.slice(0, -2)));
-    check(removed.length <= 1 && okRemoved, 'src/index.ts 沒有改動既有行（僅 instructions 結尾換行）', removed.join(' / '));
-    const addedText = added.join('\n');
-    check(/server\.tool\(\s*$/m.test(addedText) && addedText.includes('"get_award_detail"') && (addedText.match(/server\.tool\(/g) || []).length === 1, 'src/index.ts 只新增 1 支工具註冊（get_award_detail）');
+    // 這段檢查的是「本功能尚未 commit 時的工作區 diff」。commit 之後 index.ts 的 diff 會變成
+    // 後續其他變更，再比對就會誤報，所以改抓引入 get_award_detail 的那個 commit 的 diff；
+    // 兩者都沒有（例如淺層 clone）就 SKIP，不要假 FAIL。
+    const introduced = git('log', '--format=%H', '-1', '-S', '"get_award_detail"', '--', 'src/index.ts').trim();
+    const working = git('diff', 'HEAD', '--unified=0', '--', 'src/index.ts');
+    const diff = working.includes('get_award_detail') ? working
+      : introduced ? git('show', '--format=', '--unified=0', introduced, '--', 'src/index.ts')
+      : '';
+    if (!diff) {
+      skip('src/index.ts diff 檢查', '找不到引入 get_award_detail 的變更');
+    } else {
+      const removed = diff.split('\n').filter(l => l.startsWith('-') && !l.startsWith('---')).map(l => l.slice(1));
+      const added = diff.split('\n').filter(l => l.startsWith('+') && !l.startsWith('+++')).map(l => l.slice(1));
+      // 唯一允許被改的舊行是 instructions 第 6 條結尾（反引號移到新的第 7 條後面）
+      const okRemoved = removed.every(l => l.endsWith('`,') && added.includes(l.slice(0, -2)));
+      check(removed.length <= 1 && okRemoved, 'src/index.ts 沒有改動既有行（僅 instructions 結尾換行）', removed.join(' / '));
+      const addedText = added.join('\n');
+      check(/server\.tool\(\s*$/m.test(addedText) && addedText.includes('"get_award_detail"') && (addedText.match(/server\.tool\(/g) || []).length === 1, 'src/index.ts 只新增 1 支工具註冊（get_award_detail）');
+    }
     const changed = git('status', '--porcelain').split('\n').filter(Boolean).map(l => l.slice(3).replace(/^"|"$/g, ''));
     const allowed = ['src/index.ts', 'src/types/award.ts', 'src/services/award-detail-crawler.ts', '_smoke_mcp.mjs', '_smoke_award_detail.mjs'];
     check(changed.every(f => allowed.includes(f)), '變動檔案只有本功能相關檔', changed.join(', '));
