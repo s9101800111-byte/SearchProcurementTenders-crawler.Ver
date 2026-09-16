@@ -12,6 +12,10 @@ import {
 } from "./services/award-service.js";
 import { resolveCounties, listCounties, OTHER_LOCATION_CODE } from "./services/award-locations.js";
 import { ExecLocationOption } from "./types/award.js";
+import {
+  fetchAwardDetails, renderAwardDetails, MAX_AWARD_FETCH_PER_CALL, MAX_AWARD_CASES,
+  DETAIL_WINDOW_MAX, DETAIL_WINDOW_MS, FULL_FIELDS_MAX_CASES,
+} from "./services/award-detail-crawler.js";
 
 const server = new McpServer({
   name: "taiwan-tender-searcher",
@@ -34,7 +38,11 @@ const server = new McpServer({
 5. get_tender_detail 受網站流量控制，一次最多 8 筆未快取的案子。遇到驗證碼頁就附連結
    請使用者人工開啟，**不要重試迴圈，也不要試圖繞過驗證碼**。
 6. 查「已決標」案件（某期間／某縣市／某分類的決標案、決標金額）一律用 search_awards，
-   **不要用 search_tender_archive 篩決標日期**——archive 的公告日是招標公告日，會篩錯。`,
+   **不要用 search_tender_archive 篩決標日期**——archive 的公告日是招標公告日，會篩錯。
+7. 要查得標廠商／投標家數／落標廠商，用 get_award_detail（餵 search_awards 表格裡的連結）。
+   **不要把決標公告或無法決標公告的連結餵給 get_tender_detail**——pk 屬於不同編號空間，會回傳別的案子。
+   get_award_detail 任意 ${DETAIL_WINDOW_MS / 60000} 分鐘內最多 ${DETAIL_WINDOW_MAX} 次內頁請求（種類不符、解析失敗、連線錯誤也會佔額度），
+   跨呼叫與跨行程共用，超出的會附最早可再查的時間；遇到驗證碼就停，不要重試。`,
 });
 
 server.tool(
@@ -411,6 +419,23 @@ server.tool(
       return reply(out);
     } catch (error: any) {
       return reply(`決標查詢失敗: ${error.message}`);
+    }
+  }
+);
+
+server.tool(
+  "get_award_detail",
+  `Fetch the AWARD NOTICE detail page (決標公告內頁 QueryAtmAwardDetail, or 無法決標公告 QueryAtmNonAwardDetail) for cases given as the links in search_awards' table (or raw pk values). This is the ONLY complete source of winning vendors — the award listing has no vendor column. Per case it returns 得標廠商 with 統編, 投標廠商家數, 落標廠商, 預算金額, 總決標金額, 減標率 (1 − 總決標金額/預算金額), 決標方式, 決標日期, 決標公告日期, 履約地點（含地區）, 履約起迄, and a bidder table (序號/廠商名稱/統編/是否得標/中小企業/地址/決標金額); 無法決標 notices show the reason and dates. full=true appends every field on the page, but only for the first ${FULL_FIELDS_MAX_CASES} successful cases (the rest get the summary table only). LIMITS — tell the user whenever they affect the answer: (1) RATE LIMIT: the site CAPTCHA-locks detail pages after roughly 5~8 consecutive requests (the lock lasts 20+ minutes), so each call makes at most ${MAX_AWARD_FETCH_PER_CALL} detail-page requests, sequentially and ≥3 s apart, and this server makes at most ${DETAIL_WINDOW_MAX} detail-page requests in ANY rolling ${DETAIL_WINDOW_MS / 60000}-minute window, shared across all calls (including concurrent ones) and across MCP processes — 任意 ${DETAIL_WINDOW_MS / 60000} 分鐘內最多 ${DETAIL_WINDOW_MAX} 次內頁請求（種類不符、解析失敗、連線錯誤也會佔額度）; cases whose parse can be trusted are cached locally, and re-querying them is free and does not use that quota. Cases beyond the quota are listed as not retrieved with the earliest time they can be fetched — query them in a LATER call after that time, do not loop. If the CAPTCHA page appears the whole batch stops immediately and this server refuses further detail requests for 20 minutes (cached cases still return): do NOT retry and never try to bypass the CAPTCHA; give the user the links to open manually. (2) 統編 may be MASKED (e.g. F1275*****, sole proprietors / individuals) — it is reported as-is, never guess the hidden digits. (3) 決標公告日期 ≠ 決標日期: the notice usually lags the award by 1~20 days. (4) Pass the FULL link: a bare pk carries no path to tell 決標 from 無法決標, so it is treated as a 決標公告. (5) Tender-notice links (tpam?pk= / searchTenderDetail?pkPmsMain=) are rejected — use get_tender_detail for 招標公告; conversely never feed 決標／無法決標 links to get_tender_detail (different pk key space, it returns a WRONG case). This tool returns pre-formatted Markdown; output it verbatim without changing its structure.`,
+  {
+    cases: z.array(z.string()).min(1).max(MAX_AWARD_CASES).describe(`search_awards 表格裡的「決標公告／無法決標公告」連結，或 pk 值（純 pk 預設當決標公告），1~${MAX_AWARD_CASES} 筆；每次最多 ${MAX_AWARD_FETCH_PER_CALL} 次內頁請求，且任意 ${DETAIL_WINDOW_MS / 60000} 分鐘內合計最多 ${DETAIL_WINDOW_MAX} 次內頁請求（跨呼叫與跨行程共用）`),
+    full: z.boolean().optional().describe(`true 則另附內頁全部欄位（只列前 ${FULL_FIELDS_MAX_CASES} 筆成功案），預設 false 只回精選欄位與投標廠商表`),
+  },
+  async ({ cases, full }) => {
+    try {
+      const batch = await fetchAwardDetails(cases);
+      return { content: [{ type: "text", text: renderAwardDetails(batch, { full: Boolean(full) }) }] };
+    } catch (error: any) {
+      return { content: [{ type: "text", text: `取得決標公告內頁失敗: ${error.message}` }] };
     }
   }
 );

@@ -90,3 +90,111 @@ export interface MultiLocationResult {
   requests: number;
   hasError: boolean;
 }
+
+// ---------- 決標公告內頁（get_award_detail） ----------
+
+/** award＝決標公告（QueryAtmAwardDetail）、nonAward＝無法決標公告（QueryAtmNonAwardDetail） */
+export type AwardDetailKind = 'award' | 'nonAward';
+
+export interface AwardDetailInput {
+  input: string;
+  kind: AwardDetailKind;
+  pk: string;
+  url: string;
+  /** 純 pk 沒有路徑可判斷，預設當決標公告 */
+  assumedKind: boolean;
+}
+
+export interface AwardBidder {
+  /** 投標廠商N 的 N */
+  no: number;
+  /** 廠商代碼（統編）；自然人會被遮蔽如 F1275*****，原樣保留 */
+  vendorId: string;
+  name: string;
+  /** 是否得標，原文（是／否） */
+  won: string;
+  orgType: string;
+  trade: string;
+  address: string;
+  phone: string;
+  /** 是否為中小企業，原文 */
+  sme: string;
+  /** 該廠商決標金額；未公開為 null */
+  amount: number | null;
+  period: string;
+}
+
+export interface AwardDetailRecord {
+  pageType: 'award';
+  orgName: string;
+  caseNo: string;
+  tenderName: string;
+  category: string;
+  tenderWay: string;
+  awardWay: string;
+  budget: number | null;
+  /** 底價金額，未公開為 null */
+  floorPrice: number | null;
+  totalAward: number | null;
+  awardDate: string;
+  awardNoticeDate: string;
+  /** 履約地點（含地區） */
+  execArea: string;
+  period: string;
+  bidderCount: number | null;
+  jointBid: string;
+  bidders: AwardBidder[];
+  winners: AwardBidder[];
+  losers: AwardBidder[];
+  /** 減標率％＝(1−總決標金額/預算金額)×100，小數 2 位；缺任一金額為 null */
+  discountRate: number | null;
+}
+
+export interface NonAwardDetailRecord {
+  pageType: 'nonAward';
+  orgName: string;
+  caseNo: string;
+  tenderName: string;
+  category: string;
+  reason: string;
+  /** 原招標公告之刊登採購公報日期 */
+  originalBulletinDate: string;
+  nonAwardNoticeDate: string;
+  /** 是否沿用本案號及原招標方式續行招標 */
+  continueSameCase: string;
+}
+
+export type AwardDetailFailure = 'blocked' | 'parse' | 'error' | 'invalid' | 'tender' | 'limit' | 'cooldown';
+
+export interface AwardDetailResult {
+  input: string;
+  kind?: AwardDetailKind;
+  pk: string;
+  url: string;
+  assumedKind: boolean;
+  ok: boolean;
+  cached: boolean;
+  record?: AwardDetailRecord | NonAwardDetailRecord;
+  /** 內頁全部 td/td 配對（label, value），保留重複 label 與順序 */
+  pairs?: [string, string][];
+  failure?: AwardDetailFailure;
+  message?: string;
+  /** 快取命中時的原始抓取時間（ISO） */
+  savedAt?: string;
+  /** 同一呼叫中重複輸入同一案時，指向第一次出現的 results 索引 */
+  duplicateOf?: number;
+}
+
+export interface AwardDetailBatch {
+  results: AwardDetailResult[];
+  /** 本次實際連線抓內頁的次數 */
+  fetched: number;
+  cachedCount: number;
+  blocked: boolean;
+  /** 前一次呼叫才被擋、仍在冷卻期，本次沒有連線 */
+  cooldown: boolean;
+  /** 因單次上限或 10 分鐘滾動額度而沒抓的未快取案數（不重複案件） */
+  overLimit: number;
+  /** 同一呼叫中重複輸入、已合併的筆數 */
+  duplicates: number;
+}
