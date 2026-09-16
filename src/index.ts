@@ -188,7 +188,7 @@ server.tool(
 
 server.tool(
   "search_tender_archive",
-  `Search the FULL-TEXT bulletin archive (電子公報全文檢索) of web.pcc.gov.tw. This is the ONLY way to find tenders whose bidding period has already CLOSED — search_tenders covers ONLY tenders still open for bidding (等標期內). Covers ROC years ${MIN_ROC_YEAR} to ${currentROCYear()}; the site accepts one year per request, so this tool queries at most ${MAX_YEARS_PER_CALL} years per call. Returns 種類 (招標公告 / 決標公告 / 無法決標公告), 機關名稱, 標案案號, 標案名稱, 招標公告日期, 截止投標日期, plus a detail link whose pk can be passed straight to get_tender_detail. Results are split into 等標期內 (still open) and 已截止／歷史 (closed) sections. Each year returns at most the 100 most recent matches (the site caps one response at 100 rows and its pagination needs a real browser session), and the output states the site-wide hit count whenever it is larger — narrow with a 標案案號, a tighter keyword, or one year per call instead of expecting more rows. Unless the user explicitly asked only for tenders they can still bid on, run this tool ALONGSIDE search_tenders and report both sections with their counts — write "0 筆" explicitly for an empty section instead of omitting it. This tool returns pre-formatted Markdown; output it verbatim without changing its structure.`,
+  `Search the FULL-TEXT bulletin archive (電子公報全文檢索) of web.pcc.gov.tw. This is the ONLY way to find tenders whose bidding period has already CLOSED — search_tenders covers ONLY tenders still open for bidding (等標期內). Covers ROC years ${MIN_ROC_YEAR} to ${currentROCYear()}; the site accepts one year per request, so this tool queries at most ${MAX_YEARS_PER_CALL} years per call. Returns 種類 (招標公告 / 決標公告 / 無法決標公告), 機關名稱, 標案案號, 標案名稱, and BOTH dates the bulletin carries: 招標公告日 and 決標/無法決標公告日, plus 截止投標日期 and a detail link. TWO CORRECTNESS NOTES: (a) the site's own 種類 column labels 無法決標公告 as 決標公告 — this tool re-derives it from the link type (atm vs nonAtm) and the "(無法決標)" suffix, so trust the 種類 column here, not the site's; (b) this tool's publishFrom/publishTo filter and the bulletin's sort key are the 招標公告日, NOT the award date — for "which cases were awarded in period X" use search_awards instead, which filters server-side on 決標公告日. Feed 招標公告 links to get_tender_detail and 決標/無法決標公告 links to get_award_detail (different key spaces). Results are split into 等標期內 (still open) and 已截止／歷史 (closed) sections. Each year returns at most the 100 most recent matches (the site caps one response at 100 rows and its pagination needs a real browser session), and the output states the site-wide hit count whenever it is larger — narrow with a 標案案號, a tighter keyword, or one year per call instead of expecting more rows. Unless the user explicitly asked only for tenders they can still bid on, run this tool ALONGSIDE search_tenders and report both sections with their counts — write "0 筆" explicitly for an empty section instead of omitting it. This tool returns pre-formatted Markdown; output it verbatim without changing its structure.`,
   {
     keyword: z.string().min(1).describe("全文查詢字串。支援布林語法：AND（或 , &）、OR（或 ; |）、NOT（或 !）與括號；含保留字請用雙引號包住。也可直接放標案案號。"),
     years: z.string().optional().describe(`民國年度，官網一次只吃一年，本工具一次最多 ${MAX_YEARS_PER_CALL} 年。可寫 115、114,115、113-115。預設當年（${currentROCYear()}），範圍 ${MIN_ROC_YEAR}~${currentROCYear()}。`),
@@ -236,11 +236,11 @@ server.tool(
       const closed = results.filter(r => r.closed);
 
       const table = (rows: typeof results) => {
-        let t = `| 種類 | 機關 | 案號 | 標案名稱 | 公告日 | 截止投標 | 狀態 | 連結 |\n`;
-        t += `| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n`;
+        let t = `| 種類 | 機關 | 案號 | 標案名稱 | 招標公告日 | 決標/無法決標公告日 | 截止投標 | 狀態 | 連結 |\n`;
+        t += `| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n`;
         rows.forEach(r => {
           const title = r.title.length > 35 ? r.title.slice(0, 33) + '...' : r.title;
-          t += `| ${r.kind} | ${r.orgName} | **${r.caseId}** | ${title} | ${r.publishDate} | ${r.deadline || '-'} | ${r.status} | ${r.link ? `[查看](${r.link})` : '-'} |\n`;
+          t += `| ${r.kind} | ${r.orgName} | **${r.caseId}** | ${title} | ${r.publishDate || '-'} | ${r.awardDate || '-'} | ${r.deadline || '-'} | ${r.status} | ${r.link ? `[查看](${r.link})` : '-'} |\n`;
         });
         return t;
       };
@@ -254,7 +254,9 @@ server.tool(
       if (truncated) {
         out += `> **註：官網命中 ${siteTotal} 筆，但單次只取得最新 100 筆／年度（官網分頁需瀏覽器 session、pageSize 硬上限 100），結果不完整。請縮小條件：改用標案案號、更精準的關鍵字，或逐年分開查。**\n`;
       }
-      out += `> 「查看」連結可直接餵給 get_tender_detail 取標的分類與廠商資格（一次最多 8 筆）。\n`;
+      out += `> 「種類」已依連結型態修正：官網該欄把無法決標公告也寫成「決標公告」，本表以 atm／nonAtm 與「(無法決標)」後綴判定。\n`;
+      out += `> 日期有兩欄：「招標公告日」是公報排序與本工具日期篩選的依據；「決標/無法決標公告日」是決標側的日期。**要依決標期間查案件請用 search_awards**，用本工具的日期條件會篩到招標公告日。\n`;
+      out += `> 招標公告的「查看」連結可餵給 get_tender_detail；決標／無法決標公告的連結要餵 get_award_detail（兩者 pk 屬不同編號空間）。\n`;
 
       return { content: [{ type: "text", text: out }] };
     } catch (error: any) {

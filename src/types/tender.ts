@@ -78,8 +78,12 @@ export type TenderStatusType = '招標' | '決標' | '公開閱覽及公開徵�
 export interface ArchiveTender {
   /** 去重用的鍵（優先用內頁連結） */
   key: string;
-  /** 種類：招標公告 / 決標公告 / 無法決標公告 / 更正公告… */
+  /** 種類（已修正）：招標公告 / 決標公告 / 無法決標公告 / 更正公告… */
   kind: string;
+  /** 官網「種類」欄原文——它把無法決標也寫成「決標公告」，僅供對照 */
+  siteKind: string;
+  /** 是否為無法決標公告（依連結 nonAtm 或「(無法決標)」後綴判定） */
+  isNonAward: boolean;
   /** 機關名稱 */
   orgName: string;
   /** 標案案號 */

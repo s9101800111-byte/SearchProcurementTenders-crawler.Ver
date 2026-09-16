@@ -954,9 +954,11 @@ ${td('投標廠商1', '')}${td('廠商代碼', '12345678')}${td('廠商名稱', 
     // 兩者都沒有（例如淺層 clone）就 SKIP，不要假 FAIL。
     const introduced = git('log', '--format=%H', '-1', '-S', '"get_award_detail"', '--', 'src/index.ts').trim();
     const working = git('diff', 'HEAD', '--unified=0', '--', 'src/index.ts');
-    const diff = working.includes('get_award_detail') ? working
-      : introduced ? git('show', '--format=', '--unified=0', introduced, '--', 'src/index.ts')
+    // 已 commit 就用那個 commit 的 diff（工作區之後會有別的變更，拿來比會誤報）
+    const diff = introduced ? git('show', '--format=', '--unified=0', introduced, '--', 'src/index.ts')
+      : working.includes('get_award_detail') ? working
       : '';
+    const uncommitted = !introduced;
     if (!diff) {
       skip('src/index.ts diff 檢查', '找不到引入 get_award_detail 的變更');
     } else {
@@ -968,10 +970,16 @@ ${td('投標廠商1', '')}${td('廠商代碼', '12345678')}${td('廠商名稱', 
       const addedText = added.join('\n');
       check(/server\.tool\(\s*$/m.test(addedText) && addedText.includes('"get_award_detail"') && (addedText.match(/server\.tool\(/g) || []).length === 1, 'src/index.ts 只新增 1 支工具註冊（get_award_detail）');
     }
-    const changed = git('status', '--porcelain').split('\n').filter(Boolean).map(l => l.slice(3).replace(/^"|"$/g, ''));
-    const allowed = ['src/index.ts', 'src/types/award.ts', 'src/services/award-detail-crawler.ts', '_smoke_mcp.mjs', '_smoke_award_detail.mjs'];
-    check(changed.every(f => allowed.includes(f)), '變動檔案只有本功能相關檔', changed.join(', '));
-    const typesDiff = git('diff', 'HEAD', '--unified=0', '--', 'src/types/award.ts');
+    if (uncommitted) {
+      const changed = git('status', '--porcelain').split('\n').filter(Boolean).map(l => l.slice(3).replace(/^"|"$/g, ''));
+      const allowed = ['src/index.ts', 'src/types/award.ts', 'src/services/award-detail-crawler.ts', '_smoke_mcp.mjs', '_smoke_award_detail.mjs'];
+      check(changed.every(f => allowed.includes(f)), '變動檔案只有本功能相關檔', changed.join(', '));
+    } else {
+      skip('變動檔案只有本功能相關檔', '本功能已 commit，工作區變更屬其他工作');
+    }
+    const typesDiff = uncommitted
+      ? git('diff', 'HEAD', '--unified=0', '--', 'src/types/award.ts')
+      : git('show', '--format=', '--unified=0', introduced, '--', 'src/types/award.ts');
     check(!typesDiff.split('\n').some(l => l.startsWith('-') && !l.startsWith('---')), 'src/types/award.ts 只新增、不改既有型別');
     const texts = [git('diff', 'HEAD'), ...['src/services/award-detail-crawler.ts', '_smoke_award_detail.mjs'].map(f => readFileSync(join(ROOT, f), 'utf8'))].join('\n');
     const user = userInfo().username;
