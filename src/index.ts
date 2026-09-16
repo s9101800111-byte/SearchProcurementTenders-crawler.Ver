@@ -7,7 +7,7 @@ import { toROCNumber, formatROCNumber } from "./utils/date.js";
 import { searchArchive, parseYears, currentROCYear, MIN_ROC_YEAR, MAX_YEARS_PER_CALL } from "./services/archive-service.js";
 import { TenderStatusType } from "./types/tender.js";
 import {
-  queryAwardsByLocations, exportAwards, isValidRocNumber, rocNumberToWestern, todayRocNumber, rocDaysBetween,
+  queryAwardsByLocations, queryAwardsByVendor, exportAwards, isValidRocNumber, rocNumberToWestern, todayRocNumber, rocDaysBetween,
   AWARD_DATA_START_ROC, MAX_RANGE_DAYS,
 } from "./services/award-service.js";
 import { resolveCounties, listCounties, OTHER_LOCATION_CODE } from "./services/award-locations.js";
@@ -439,6 +439,107 @@ server.tool(
       return { content: [{ type: "text", text: renderAwardDetails(batch, { full: Boolean(full) }) }] };
     } catch (error: any) {
       return { content: [{ type: "text", text: `取得決標公告內頁失敗: ${error.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  "find_awards_by_vendor",
+  `Find which cases a VENDOR won (and optionally which it merely bid on and lost) from web.pcc.gov.tw's award-query listing. Give a 統一編號 (8 digits, exact and safest) or a company name (PARTIAL match: 「中興工程顧問」 also matches 「中興工程顧問社」, a different company). Verified live 2026-09-16: gottenVendorId / gottenVendorName / submitVendorId / submitVendorName all filter server-side, and the listing endpoint has NO CAPTCHA rate limit, so one vendor costs about one request — this is the fast way to answer "what has firm X won lately", competitor tracking, or checking a vendor before working with them. includeBids=true additionally queries the BIDDER field and reports 投標但未得標 cases (won set subtracted), which otherwise would require opening each award notice. Results are NATIONWIDE (no 履約地點 filter) within the 決標公告日 range; the site only covers 112/07/01 onward and one call's range may not exceed ${MAX_RANGE_DAYS} days. The listing gives 決標金額 but NOT the vendor's own share in a joint bid — use get_award_detail on a specific case for bidder-level numbers. CAVEATS: (1) name matching is substring-based, so a short name can pull in unrelated firms and a firm registered under a slightly different legal name will be missed — prefer 統一編號; (2) 決標公告日 ≠ 決標日 (the notice lags 1~20 days), so recent cases may not be listed yet; (3) rows flagged 更正公告 show the correction date. This tool returns pre-formatted Markdown; output it verbatim.`,
+  {
+    vendors: z.array(z.string().min(2)).min(1).max(20).describe("廠商統一編號（8 碼數字，精準）或廠商名稱（部分比對），一次最多 20 家"),
+    from: z.string().describe("決標公告日起（必填）。民國或西元皆可：115/07/11、1150711、2026-07-11"),
+    to: z.string().optional().describe("決標公告日迄（同上格式），預設今天"),
+    category: z.enum(["工程", "財物", "勞務"]).optional().describe("標的分類；不填＝全部"),
+    includeBids: z.boolean().optional().describe("true 則另查「投標廠商」欄，列出投標但未得標的案子（每家多一次請求），預設 false"),
+    maxRowsPerVendor: z.number().int().min(1).max(1000).optional().describe("每家廠商最多回傳幾列，預設 200"),
+    previewRows: z.number().int().min(0).max(200).optional().describe("每家在表格中最多列出幾列，預設 30；超過的全部結果會另存 CSV＋JSON"),
+  },
+  async ({ vendors, from, to, category, includeBids, maxRowsPerVendor, previewRows }) => {
+    const reply = (text: string) => ({ content: [{ type: "text" as const, text }] });
+    try {
+      const cap = maxRowsPerVendor ?? 200;
+      const preview = previewRows ?? 30;
+
+      const fromN = toROCNumber(from);
+      const toN = to ? toROCNumber(to) : todayRocNumber();
+      if (fromN == null || !isValidRocNumber(fromN) || toN == null || !isValidRocNumber(toN)) {
+        return reply(`日期格式無法解析：${fromN == null || !isValidRocNumber(fromN) ? `from="${from}"` : ''}${toN == null || !isValidRocNumber(toN) ? ` to="${to}"` : ''}。請用 115/07/11 或 2026-07-11 這類格式。`);
+      }
+      if (fromN > toN) return reply(`起日 ${formatROCNumber(fromN)} 晚於迄日 ${formatROCNumber(toN)}，請對調。`);
+      if (toN < AWARD_DATA_START_ROC) return reply(`官網決標查詢只提供 112/07/01 之後的資料，${formatROCNumber(fromN)} ~ ${formatROCNumber(toN)} 整段早於此。`);
+      const effFrom = Math.max(fromN, AWARD_DATA_START_ROC);
+      const days = rocDaysBetween(effFrom, toN);
+      if (days > MAX_RANGE_DAYS) {
+        return reply(`決標公告日區間相差 ${days} 天，超過官網上限 ${MAX_RANGE_DAYS} 天，請分段查詢。`);
+      }
+
+      const fmt = (n: number) => n.toLocaleString('en-US');
+      const uniq = [...new Set(vendors.map(v => v.trim()).filter(Boolean))];
+      const results = [];
+      for (const v of uniq) {
+        results.push(await queryAwardsByVendor(
+          { from: effFrom, to: toN, category, status: '決標' },
+          v,
+          { maxRows: cap, includeBids: Boolean(includeBids) },
+        ));
+        if (results[results.length - 1].blocked) break;
+      }
+
+      let out = `### 廠商反查決標案件（${results.length} 家）\n\n`;
+      out += `> 決標公告日 ${formatROCNumber(effFrom)} ~ ${formatROCNumber(toN)}｜標的分類 ${category ?? '不限'}｜全國（不限履約地點）｜${includeBids ? '含投標未得標' : '只查得標'}\n\n`;
+
+      const allRows: typeof results[number]['won'] = [];
+      for (const r of results) {
+        const wonAmt = r.won.reduce((s, x) => s + (x.amount ?? 0), 0);
+        out += `#### ${r.vendor}${r.byId ? '（統編）' : '（名稱部分比對）'}\n\n`;
+        if (r.error) out += `- **查詢異常：${r.error}**\n`;
+        out += `- 得標 ${fmt(r.won.length)} 件（官網共 ${fmt(r.siteTotalWon)} 件）｜決標金額合計 ${fmt(wonAmt)} 元\n`;
+        if (includeBids) {
+          out += r.siteTotalBid == null
+            ? `- 投標未得標：未查詢\n`
+            : `- 投標未得標 ${fmt(r.lost.length)} 件（投標總計 ${fmt(r.siteTotalBid)} 件，扣掉得標 ${fmt(r.won.length)} 件）\n`;
+        }
+        if (r.truncated) out += `- **已達 maxRowsPerVendor=${cap} 截斷，官網件數見上方**\n`;
+
+        const rows = [...r.won.map(x => ({ x, tag: '得標' })), ...r.lost.map(x => ({ x, tag: '投標未得標' }))];
+        allRows.push(...r.won, ...r.lost);
+        if (rows.length === 0) {
+          out += `\n（這個區間內查無案件）\n\n`;
+          continue;
+        }
+        out += `\n| 決標公告日 | 結果 | 機關 | 案號 | 標案名稱 | 決標金額 | 更正 | 連結 |\n`;
+        out += `| :--- | :--- | :--- | :--- | :--- | ---: | :--- | :--- |\n`;
+        for (const { x, tag } of rows.slice(0, preview)) {
+          const title = x.tenderName.length > 32 ? x.tenderName.slice(0, 30) + '...' : x.tenderName;
+          const cell = (s: string) => s.replace(/\|/g, '\\|').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+          out += `| ${x.awardNoticeDate} | ${tag} | ${cell(x.orgName)} | ${cell(x.caseNo)} | ${cell(title)} | ${x.amount == null ? '未公開' : fmt(x.amount)} | ${x.isCorrection ? '更正' : ''} | ${x.url ? `[公告](${x.url})` : '-'} |\n`;
+        }
+        if (rows.length > preview) out += `\n> 這家還有 ${fmt(rows.length - preview)} 列未列出（見下方匯出檔）。\n`;
+        out += `\n`;
+      }
+
+      if (allRows.length > preview) {
+        try {
+          const { csvPath, jsonPath } = await exportAwards(allRows, {
+            tool: 'find_awards_by_vendor', vendors: uniq, includeBids: Boolean(includeBids),
+            from: formatROCNumber(effFrom), to: formatROCNumber(toN), category: category ?? null,
+          });
+          out += `**全部 ${fmt(allRows.length)} 列已匯出：**\n- CSV：${csvPath}\n- JSON：${jsonPath}\n\n`;
+        } catch (e: any) {
+          out += `**匯出檔寫入失敗：${e.message}**\n\n`;
+        }
+      }
+
+      const blocked = results.some(r => r.blocked);
+      if (blocked) out += `> **官網對本次連線啟動流量控制，已停止後續廠商的查詢（清單端點少見，請稍後再試，不要重複重試）。**\n`;
+      out += `> 本次連線 ${fmt(results.reduce((s, r) => s + r.requests, 0))} 次（僅清單端點）。\n`;
+      out += `> 名稱是部分比對（「中興工程顧問」會連「中興工程顧問社」一起命中），要精準請給 8 碼統一編號；決標公告日落後決標日 1~20 天，最近的案子可能還沒公告。\n`;
+      out += `> 清單沒有共同投標時各家的分攤金額，要看個別廠商金額請對該案用 get_award_detail。\n`;
+
+      return reply(out);
+    } catch (error: any) {
+      return reply(`廠商反查失敗: ${error.message}`);
     }
   }
 );

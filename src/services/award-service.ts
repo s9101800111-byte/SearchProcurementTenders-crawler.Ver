@@ -379,3 +379,58 @@ export async function exportAwards(rows: AwardRow[], meta: Record<string, unknow
   await writeFile(jsonPath, JSON.stringify({ ...meta, exportedAt: new Date().toISOString(), rowCount: rows.length, rows }, null, 1), 'utf8');
   return { csvPath, jsonPath };
 }
+
+// ---------- 用廠商反查案件（find_awards_by_vendor） ----------
+
+/** 8 碼數字＝統一編號，其餘當廠商名稱（部分比對） */
+export function isVendorId(s: string): boolean {
+  return /^\d{8}$/.test(s.trim());
+}
+
+export interface VendorAwardResult {
+  vendor: string;
+  byId: boolean;
+  /** 得標的案子 */
+  won: AwardRow[];
+  /** 有投標但沒得標的案子（role 含 bidder 時才有） */
+  lost: AwardRow[];
+  siteTotalWon: number;
+  siteTotalBid: number | null;
+  truncated: boolean;
+  requests: number;
+  error?: string;
+  blocked?: boolean;
+}
+
+/**
+ * 一家廠商查一次（得標）；要落標紀錄就再查一次投標廠商欄，兩者相減。
+ * 官網三個欄位實測皆有效（2026-09-16）：gottenVendorId／gottenVendorName／submitVendorId／submitVendorName，
+ * 名稱是部分比對——「中興工程顧問」會連「中興工程顧問社」一起命中，能給統編就給統編。
+ */
+export async function queryAwardsByVendor(
+  base: Omit<AwardQuery, 'execLocation' | 'gottenVendorName' | 'gottenVendorId' | 'submitVendorName' | 'submitVendorId'>,
+  vendor: string,
+  opts: { maxRows: number; includeBids: boolean },
+): Promise<VendorAwardResult> {
+  const v = vendor.trim();
+  const byId = isVendorId(v);
+  const wonQ: AwardQuery = byId ? { ...base, gottenVendorId: v } : { ...base, gottenVendorName: v };
+  const won = await queryAwards(wonQ, { maxRows: opts.maxRows });
+  const out: VendorAwardResult = {
+    vendor: v, byId, won: won.rows, lost: [],
+    siteTotalWon: won.siteTotal, siteTotalBid: null,
+    truncated: won.truncated, requests: won.requests, error: won.error, blocked: won.blocked,
+  };
+  if (!opts.includeBids || won.blocked) return out;
+
+  const bidQ: AwardQuery = byId ? { ...base, submitVendorId: v } : { ...base, submitVendorName: v };
+  const bid = await queryAwards(bidQ, { maxRows: opts.maxRows });
+  out.requests += bid.requests;
+  out.siteTotalBid = bid.siteTotal;
+  if (bid.error) out.error = out.error ? `${out.error}；投標查詢：${bid.error}` : `投標查詢：${bid.error}`;
+  if (bid.blocked) out.blocked = true;
+  out.truncated = out.truncated || bid.truncated;
+  const wonKeys = new Set(won.rows.map(awardDedupKey));
+  out.lost = bid.rows.filter(r => !wonKeys.has(awardDedupKey(r)));
+  return out;
+}

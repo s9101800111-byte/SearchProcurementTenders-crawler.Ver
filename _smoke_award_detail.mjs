@@ -140,7 +140,8 @@ try {
   const tools = (await server.rpc('tools/list')).result.tools;
   const names = tools.map(t => t.name);
   for (const n of ['search_tenders', 'get_tender_detail', 'search_tender_archive', 'search_awards', 'get_award_detail']) check(names.includes(n), `${n} 已註冊`);
-  check(names.length === 5, '共 5 支工具', names.join(', '));
+  // 不寫死總數：之後新增工具不該讓這支誤報（總數由 _smoke_mcp.mjs 檢查）
+  check(names.length >= 5 && new Set(names).size === names.length, '工具名稱不重複且不少於本功能所需', names.join(', '));
   const tool = tools.find(t => t.name === 'get_award_detail');
   const props = tool?.inputSchema?.properties ?? {};
   check(JSON.stringify(Object.keys(props)) === '["cases","full"]', '參數為 cases、full', Object.keys(props).join(', '));
