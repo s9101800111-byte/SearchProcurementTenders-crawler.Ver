@@ -49,8 +49,8 @@ export interface TenderDetail {
   url: string;
   /** 是否成功取得內容（false 代表被驗證碼擋或版型不符） */
   ok: boolean;
-  /** 失敗原因：captcha=流量控制驗證碼、parse=版型不符、error=連線錯誤 */
-  reason?: 'captcha' | 'parse' | 'error';
+  /** 失敗原因：captcha=流量控制驗證碼、parse=版型不符、error=連線錯誤、award=決標類公告連結（請改用 get_award_detail） */
+  reason?: 'captcha' | 'parse' | 'error' | 'award';
   /** 錯誤訊息（reason=error 時） */
   message?: string;
   /** 欄位表（label -> value） */

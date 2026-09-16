@@ -131,7 +131,7 @@ server.tool(
 
 server.tool(
   "get_tender_detail",
-  `Fetch the DETAIL page of specific tenders from web.pcc.gov.tw, given the links returned by search_tenders (or raw pk values). Returns fields that the search listing does NOT contain: 標的分類 (category code, e.g. 5177 室內裝潢工程 / 5179 其他裝修工程), 廠商資格摘要 (vendor qualification), 截止投標 with time-of-day, 決標方式, 押標金, 履約地點/期限, and agency contact info. Use this to judge whether a tender really is the type of work the user wants — the category code is far more reliable than keyword matching on the tender name. IMPORTANT: the site rate-limits detail pages; at most ${MAX_FETCH_PER_CALL} uncached tenders per call, results are cached locally so re-querying the same tender is free. If the site returns its CAPTCHA page the remaining items are reported as not-retrieved with their links — do NOT retry in a loop, tell the user to open those links manually.`,
+  `Fetch the DETAIL page of specific tenders from web.pcc.gov.tw, given the links returned by search_tenders (or raw pk values). Returns fields that the search listing does NOT contain: 標的分類 (category code, e.g. 5177 室內裝潢工程 / 5179 其他裝修工程), 廠商資格摘要 (vendor qualification), 截止投標 with time-of-day, 決標方式, 押標金, 履約地點/期限, and agency contact info. Use this to judge whether a tender really is the type of work the user wants — the category code is far more reliable than keyword matching on the tender name. IMPORTANT: the site rate-limits detail pages; at most ${MAX_FETCH_PER_CALL} uncached tenders per call, results are cached locally so re-querying the same tender is free. If the site returns its CAPTCHA page the remaining items are reported as not-retrieved with their links — do NOT retry in a loop, tell the user to open those links manually. SCOPE: this tool is for TENDER notices (招標公告) only. Award-notice links — 決標公告 (…/common/atm?pk=), 無法決標公告 (…/common/nonAtm?pk=), or any URL carrying pkAtmMain=, which is what search_awards and search_tender_archive return for awards — live in a DIFFERENT key space and are now rejected WITHOUT a request; use get_award_detail for those. (Before this guard, feeding an award pk here silently returned a DIFFERENT tender that happened to share the number.)`,
   {
     cases: z.array(z.string()).min(1).describe("標案內頁連結（search_tenders 回傳的「查看」網址）或 pk 值，一次最多建議 8 筆"),
     full: z.boolean().optional().describe("true 則回傳內頁全部欄位（約 70 項），預設只回精選欄位"),
@@ -167,6 +167,7 @@ server.tool(
         out += `---\n\n**以下 ${failed.length} 筆未取得，請自行點開確認：**\n\n`;
         failed.forEach(d => {
           const why = d.reason === 'captcha' ? '網站流量控制（驗證碼）'
+            : d.reason === 'award' ? (d.message || '這是決標類公告連結，請改用 get_award_detail')
             : d.reason === 'parse' ? (d.message || '內頁版型不符，可能非一般招標公告')
             : d.message || '連線失敗';
           out += `- ${d.url ? `[${d.pk}](${d.url})` : d.input} — ${why}\n`;
