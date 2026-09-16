@@ -16,6 +16,9 @@ import {
   fetchAwardDetails, renderAwardDetails, MAX_AWARD_FETCH_PER_CALL, MAX_AWARD_CASES,
   DETAIL_WINDOW_MAX, DETAIL_WINDOW_MS, FULL_FIELDS_MAX_CASES,
 } from "./services/award-detail-crawler.js";
+import {
+  createJob, loadJob, listJobs, runJob, setJobState, jobSummary, seedVendorsFromCache,
+} from "./services/resolve-service.js";
 
 const server = new McpServer({
   name: "taiwan-tender-searcher",
@@ -540,6 +543,134 @@ server.tool(
       return reply(out);
     } catch (error: any) {
       return reply(`廠商反查失敗: ${error.message}`);
+    }
+  }
+);
+
+server.tool(
+  "resolve_award_vendors",
+  `Batch-resolve WINNING VENDORS for a whole set of awarded cases, working around the detail-page CAPTCHA rate limit. Runs as a BACKGROUND JOB with a persisted, resumable state file — start it, then poll with action="status"; it keeps going while this MCP server process lives (restarting Claude restarts the process, so re-run action="start" with the same jobId to resume). Strategy, alternating automatically: (1) FREE lookups — the same firm usually wins several cases, so every known vendor name/統編 is reverse-queried on the listing endpoint (no CAPTCHA limit), often resolving many cases per request; every vendor newly discovered from a detail page is queued for lookup too; (2) RATE-LIMITED detail pages — whatever is left is opened one by one, largest 決標金額 first, honouring the shared ${DETAIL_WINDOW_MAX}-requests-per-${DETAIL_WINDOW_MS / 60000}-minutes budget, so the valuable cases land first and the job survives being interrupted. Measured on a real 341-case batch: detail pages alone would take ~14 h; with lookups most cases resolve in a fraction of that. action="start" takes either explicit cases (pk/links) or a query (from/to/category/counties) that it runs through the same search as search_awards. action="result" returns the table and writes CSV+JSON under .cache/exports/. NOTE: lookup-resolved rows give the vendor name (and 統編 when looked up by id) but NOT 投標家數/落標廠商/預算/減標率 — those only come from the detail page; the 資料來源 column says which is which.`,
+  {
+    action: z.enum(["start", "status", "stop", "result", "list"]).describe("start=建立或續跑工作｜status=查進度｜stop=暫停｜result=取結果與匯出｜list=列出所有工作"),
+    jobId: z.string().optional().describe("status／stop／result 必填；start 帶上則續跑該工作"),
+    from: z.string().optional().describe("start 用：決標公告日起（民國或西元）"),
+    to: z.string().optional().describe("start 用：決標公告日迄，預設今天"),
+    category: z.enum(["工程", "財物", "勞務"]).optional().describe("start 用：標的分類"),
+    counties: z.array(z.string()).optional().describe("start 用：縣市（同 search_awards，會自動展開全部代碼）"),
+    includeOther: z.boolean().optional().describe("start 用：是否加查履約地點「其他」桶"),
+    cases: z.array(z.string()).optional().describe("start 用：直接給決標公告連結或 pk（給了就不另外查清單）"),
+    label: z.string().optional().describe("start 用：工作名稱，方便之後辨識"),
+    maxCases: z.number().int().min(1).max(3000).optional().describe("start 用：案件數上限，預設 1000"),
+  },
+  async ({ action, jobId, from, to, category, counties, includeOther, cases, label, maxCases }) => {
+    const reply = (text: string) => ({ content: [{ type: "text" as const, text }] });
+    try {
+      if (action === "list") {
+        const jobs = await listJobs();
+        if (jobs.length === 0) return reply(`目前沒有補廠商工作。用 action="start" 建立一個。`);
+        let out = `### 補廠商工作（${jobs.length} 個）\n\n| 工作 ID | 名稱 | 狀態 | 進度 | 更新時間 |\n| :--- | :--- | :--- | :--- | :--- |\n`;
+        for (const j of jobs) out += `| \`${j.id}\` | ${j.label} | ${j.state} | ${j.stats.resolved}/${j.stats.total} | ${j.updatedAt} |\n`;
+        return reply(out);
+      }
+
+      if (action === "status" || action === "stop" || action === "result") {
+        if (!jobId) return reply(`action="${action}" 需要 jobId，用 action="list" 查現有工作。`);
+        if (action === "stop") {
+          const j = await setJobState(jobId, "paused");
+          return reply(j ? `### 已暫停 \`${jobId}\`\n\n${jobSummary(j)}\n\n> 再用 action="start" 帶同一個 jobId 就會從斷點續跑（已解出的不會重查）。` : `找不到工作 ${jobId}`);
+        }
+        const job = await loadJob(jobId);
+        if (!job) return reply(`找不到工作 ${jobId}，用 action="list" 查現有工作。`);
+        if (action === "status") {
+          const recent = job.cases.filter(c => c.status === "resolved").slice(-5);
+          let out = `### 補廠商進度 \`${job.id}\`（${job.label}）\n\n${jobSummary(job)}\n`;
+          if (recent.length) {
+            out += `\n最近解出：\n`;
+            for (const c of recent) out += `- ${c.caseNo} ${c.orgName} → **${c.winner}**（${c.source}）\n`;
+          }
+          return out.length ? reply(out) : reply(jobSummary(job));
+        }
+
+        // result
+        const fmt = (n: number) => n.toLocaleString("en-US");
+        let out = `### 補廠商結果 \`${job.id}\`（${job.label}）\n\n${jobSummary(job)}\n\n`;
+        const rows = job.cases.slice().sort((a, b) => (b.amount ?? 0) - (a.amount ?? 0));
+        out += `| 決標公告日 | 機關 | 案號 | 標案名稱 | 決標金額 | 得標廠商 | 資料來源 |\n| :--- | :--- | :--- | :--- | ---: | :--- | :--- |\n`;
+        const cell = (s: string) => String(s ?? "").replace(/\|/g, "\\|").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        for (const c of rows.slice(0, 50)) {
+          const title = c.tenderName.length > 30 ? c.tenderName.slice(0, 28) + "..." : c.tenderName;
+          out += `| ${c.awardNoticeDate} | ${cell(c.orgName)} | ${cell(c.caseNo)} | ${cell(title)} | ${c.amount == null ? "未公開" : fmt(c.amount)} | ${c.winner ? cell(c.winner) : "（未取得）"} | ${c.source ?? "-"} |\n`;
+        }
+        if (rows.length > 50) out += `\n> 表格只列前 50 件（依決標金額排序），完整結果見匯出檔。\n`;
+        try {
+          const { csvPath, jsonPath } = await exportAwards(
+            rows.map(c => ({
+              pk: c.pk, linkType: "atm", url: c.url, orgName: c.orgName, caseNo: c.caseNo, isCorrection: false,
+              tenderName: `${c.tenderName}`, tenderWay: "", category: "", awardNoticeDate: c.awardNoticeDate,
+              amount: c.amount, awardSeq: "", nonAwardSeq: "", isNonAward: false, execLocation: "",
+            })),
+            { tool: "resolve_award_vendors", jobId: job.id, label: job.label, stats: job.stats, winners: rows.map(c => ({ caseNo: c.caseNo, orgName: c.orgName, winner: c.winner ?? null, winnerId: c.winnerId ?? null, source: c.source ?? null, bidderCount: c.bidderCount ?? null, losers: c.losers ?? null, budget: c.budget ?? null, totalAward: c.totalAward ?? null })) },
+          );
+          out += `\n**匯出：**\n- CSV：${csvPath}\n- JSON（含得標廠商、統編、落標名單、預算）：${jsonPath}\n`;
+        } catch (e: any) {
+          out += `\n**匯出失敗：${e.message}**\n`;
+        }
+        out += `\n> 「反查」來源只有得標廠商名稱（用統編查的另有統編），沒有投標家數／落標廠商／預算／減標率；那些只在內頁有。\n`;
+        return reply(out);
+      }
+
+      // ---- start ----
+      let job = jobId ? await loadJob(jobId) : null;
+      if (!job) {
+        const fromN = from ? toROCNumber(from) : null;
+        const toN = to ? toROCNumber(to) : todayRocNumber();
+        if (!cases?.length && (fromN == null || !isValidRocNumber(fromN))) {
+          return reply(`start 需要 cases（決標公告連結／pk）或 from（決標公告日起）。給 from 時格式要像 115/07/11 或 2026-07-11。`);
+        }
+        let rows: any[] = [];
+        let rangeFrom = fromN ?? AWARD_DATA_START_ROC;
+        const rangeTo = toN == null || !isValidRocNumber(toN) ? todayRocNumber() : toN;
+
+        if (cases?.length) {
+          // 直接給案子：從連結取 pk，其餘欄位待內頁補
+          rows = cases.slice(0, maxCases ?? 1000).map(s => {
+            const m = String(s).match(/[?&]pk(?:AtmMain)?=([A-Za-z0-9+/=%]+)/i);
+            const pk = m ? decodeURIComponent(m[1]) : String(s).trim();
+            return { pk, linkType: "atm", url: /^https?:/i.test(String(s)) ? String(s).trim() : `https://web.pcc.gov.tw/prkms/urlSelector/common/atm?pk=${encodeURIComponent(pk)}`, orgName: "", caseNo: "", isCorrection: false, tenderName: "(待內頁補)", tenderWay: "", category: "", awardNoticeDate: "", amount: null, awardSeq: "", nonAwardSeq: "", isNonAward: false, execLocation: "" };
+          });
+        } else {
+          const locs: ExecLocationOption[] = (() => {
+            if (!counties?.length) return [{ code: "", label: "不限（全國）" }];
+            const { groups, invalid } = resolveCounties(counties);
+            if (invalid.length) throw new Error(`縣市名無法辨識：${invalid.map(i => i.input).join("、")}。可用：${listCounties().join("、")}`);
+            const list = groups.flatMap(g => g.locations);
+            if (includeOther) list.push({ code: OTHER_LOCATION_CODE, label: "其他" });
+            return list;
+          })();
+          const r = await queryAwardsByLocations({ from: rangeFrom, to: rangeTo, category, status: "決標" }, locs, { maxRows: maxCases ?? 1000 });
+          rows = r.rows;
+          if (!rows.length) return reply(`這個條件查不到決標案件，請放寬條件後再建立工作。`);
+        }
+
+        const seeds = await seedVendorsFromCache();
+        job = await createJob({
+          label: label ?? `${formatROCNumber(rangeFrom)}~${formatROCNumber(rangeTo)}${category ? " " + category : ""}${counties?.length ? " " + counties.join("/") : ""}`,
+          range: { from: rangeFrom, to: rangeTo, category },
+          rows,
+          seedVendors: seeds,
+        });
+      }
+
+      const started = await setJobState(job.id, "running");
+      // 背景跑，不阻塞這次呼叫；狀態都落在工作檔裡，用 action="status" 查
+      void runJob(job.id).catch(async (e: any) => {
+        const j = await loadJob(job!.id);
+        if (j) { j.state = "error"; j.message = `執行失敗：${e.message}`; await setJobState(j.id, "paused"); }
+      });
+
+      return reply(`### 已啟動補廠商工作 \`${job.id}\`\n\n${jobSummary(started ?? job)}\n\n> 種子廠商 ${job.vendorQueue.length} 家（來自先前抓過的內頁快取），先做免費反查，再用內頁補剩下的。\n> 用 \`action="status", jobId="${job.id}"\` 查進度；\`action="result"\` 取結果與匯出檔；\`action="stop"\` 暫停。\n> 這個工作跑在 MCP 伺服器行程裡：重開 Claude 會中斷，再用同一個 jobId 執行 start 即可續跑，已解出的不會重查。`);
+    } catch (error: any) {
+      return reply(`補廠商工作失敗: ${error.message}`);
     }
   }
 );

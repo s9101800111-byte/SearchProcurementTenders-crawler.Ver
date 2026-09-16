@@ -42,7 +42,8 @@ console.log('\n[1] 工具註冊');
   check(Boolean(t), 'find_awards_by_vendor 已註冊', tools.map(x => x.name).join(', '));
   check(t && ['vendors', 'from', 'includeBids'].every(p => p in (t.inputSchema?.properties ?? {})), '必要參數齊全',
     Object.keys(t?.inputSchema?.properties ?? {}).join(', '));
-  check(tools.length === 6, '共 6 支工具（原 5 支 + 本支）', String(tools.length));
+  // 不寫死總數（總數由 _smoke_mcp.mjs 檢查），只確認名稱不重複
+  check(new Set(tools.map(x => x.name)).size === tools.length, '工具名稱不重複', String(tools.length) + ' 支');
 }
 
 console.log('\n[2] 統編判定');
