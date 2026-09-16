@@ -179,6 +179,16 @@ function recount(job: ResolveJob): void {
   job.stats.failed = job.cases.filter(c => c.status === 'failed').length;
 }
 
+/**
+ * 把反查命中的廠商併進既有得標廠商（「A / B」格式，與官網複數決標一致）。
+ * gottenVendorName 是部分比對：查「大有工程顧問有限公司」也會命中「新大有工程顧問有限公司」的案子，
+ * 所以名稱若是另一個名稱的子字串就丟掉短的。
+ */
+function mergeWinners(current: string | undefined, vendor: string): string {
+  const names = [...new Set([...(current ? current.split(' / ') : []), vendor].map(s => s.trim()).filter(Boolean))];
+  return names.filter(n => !names.some(m => m !== n && m.includes(n))).join(' / ');
+}
+
 /** 一次反查：用一個廠商名／統編查同區間的決標案，命中就標記 */
 async function lookupVendor(job: ResolveJob, vendor: string): Promise<number> {
   const byId = /^\d{8}$/.test(vendor);
@@ -190,17 +200,24 @@ async function lookupVendor(job: ResolveJob, vendor: string): Promise<number> {
   if (r.blocked) throw new Error('清單端點被擋');
   if (r.error) return 0;
 
-  const byKey = new Map(job.cases.filter(c => c.status === 'unknown').map(c => [caseKey(c.orgName, c.caseNo), c]));
-  const byPk = new Map(job.cases.filter(c => c.status === 'unknown').map(c => [c.pk, c]));
+  // 已由反查解出的也要納入：複數決標案的每家得標廠商會各自命中同一案，只留第一家會漏
+  const open = job.cases.filter(c => c.status === 'unknown' || (c.status === 'resolved' && c.source === '反查'));
+  const byKey = new Map(open.map(c => [caseKey(c.orgName, c.caseNo), c]));
+  const byPk = new Map(open.map(c => [c.pk, c]));
   let hit = 0;
   for (const row of r.rows) {
     const c = byPk.get(row.pk) ?? byKey.get(caseKey(row.orgName, row.caseNo));
-    if (!c || c.status !== 'unknown') continue;
-    c.status = 'resolved';
-    c.winner = vendor;
-    c.winnerId = byId ? vendor : null;
-    c.source = '反查';
-    hit++;
+    if (!c) continue;
+    if (c.status === 'unknown') {
+      c.status = 'resolved';
+      c.winner = vendor;
+      c.winnerId = byId ? vendor : null;
+      c.source = '反查';
+      hit++;
+      continue;
+    }
+    c.winner = mergeWinners(c.winner, vendor);
+    if (byId) c.winnerId = mergeWinners(c.winnerId ?? undefined, vendor);
   }
   job.stats.solvedByLookup += hit;
   return hit;

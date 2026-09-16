@@ -22,6 +22,9 @@ const CASES = [
   { pk: 'NzEyMDAwMDAy', caseNo: 'B-002', org: '乙機關', name: '案子二', amount: 3000000, vendor: '天龍工程顧問有限公司', vendorId: '11111111' },
   { pk: 'NzEyMDAwMDAz', caseNo: 'C-003', org: '丙機關', name: '案子三', amount: 1000000, vendor: '地虎建築師事務所', vendorId: '22222222' },
 ];
+// 複數決標情境用（[6] 才放進來，不影響前面的計數）
+const EXTRA = [];
+const ALL = () => [...CASES, ...EXTRA];
 const row = c => `<tr><td>1</td><td>${c.org}</td><td>${c.caseNo} <script>var hw = Geps3.CNS.pageCode2Img("${c.name}")</script></td><td>公開招標</td><td>勞務類</td><td>115/08/01</td><td>${c.amount}</td><td>001</td><td></td><td><a href="/prkms/urlSelector/common/atm?pk=${c.pk}">檢視</a></td></tr>`;
 const listPage = rows => `<html><body>共有<span class="red"> ${rows.length} </span>筆<table>
 <tr><th>項次</th><th>機關名稱</th><th>標案案號</th><th>招標方式</th><th>標的分類</th><th>公告日期</th><th>決標金額</th><th>決標公告</th><th>無法決標</th><th>功能選項</th></tr>
@@ -44,8 +47,8 @@ function install({ detailLimitAfter = 99 } = {}) {
       const name = u.searchParams.get('gottenVendorName') || '';
       const id = u.searchParams.get('gottenVendorId') || '';
       let rows = [];
-      if (name) rows = CASES.filter(c => c.vendor.includes(name));
-      else if (id) rows = CASES.filter(c => c.vendorId === id);
+      if (name) rows = ALL().filter(c => (c.vendors ?? [c.vendor]).some(v => v.includes(name)));
+      else if (id) rows = ALL().filter(c => c.vendorId === id);
       else rows = CASES;
       return ok(listPage(rows));
     }
@@ -136,6 +139,30 @@ console.log('\n[6] 工作狀態有落檔，另一個行程讀得到');
   check(disk.stats.resolved === 3 && disk.cases.length === 3, '檔案內容與記憶體一致');
   const jobs = await svc.listJobs();
   check(jobs.some(j => j.id === job.id), 'listJobs 列得到');
+}
+
+console.log('\n[6]複數決標：每家得標廠商都要記下，部分比對誤中的短名要丟掉');
+{
+  EXTRA.push(
+    { pk: 'NzEyMDAwMDA0', caseNo: 'D-004', org: '丁機關', name: '案子四', amount: 2000000, vendor: '玄武工程顧問有限公司', vendors: ['玄武工程顧問有限公司', '朱雀技術顧問有限公司'], vendorId: '33333333' },
+    { pk: 'NzEyMDAwMDA1', caseNo: 'E-005', org: '戊機關', name: '案子五', amount: 1500000, vendor: '新大有工程顧問有限公司', vendorId: '44444444' },
+  );
+  const rows6 = EXTRA.map(c => ({ pk: c.pk, linkType: 'atm', url: `https://web.pcc.gov.tw/prkms/urlSelector/common/atm?pk=${c.pk}`, orgName: c.org, caseNo: c.caseNo, isCorrection: false, tenderName: c.name, tenderWay: '', category: '勞務類', awardNoticeDate: '115/08/01', amount: c.amount, awardSeq: '001', nonAwardSeq: '', isNonAward: false, execLocation: '' }));
+  const d0 = calls.detail;
+  const input6 = { label: '測試-複數決標', range: { from: 1150711, to: 1150911, category: '勞務' }, rows: rows6,
+    seedVendors: ['玄武工程顧問有限公司', '大有工程顧問有限公司', '朱雀技術顧問有限公司', '新大有工程顧問有限公司'] };
+  let j6 = await svc.createJob(input6);
+  // 同一批案子的 jobId 固定，上次跑留下的狀態檔會被沿用，先清掉再建
+  rmSync(join('.cache', 'resolve-jobs', `${j6.id}.json`), { force: true });
+  j6 = await svc.createJob(input6);
+  await svc.setJobState(j6.id, 'running');
+  await svc.runJob(j6.id, { maxMinutes: 1 });
+  j6 = await svc.loadJob(j6.id);
+  const by6 = Object.fromEntries(j6.cases.map(c => [c.caseNo, c]));
+  check(by6['D-004'].winner === '玄武工程顧問有限公司 / 朱雀技術顧問有限公司', 'D-004 兩家得標都記下（不是只留第一家）', by6['D-004'].winner);
+  check(by6['E-005'].winner === '新大有工程顧問有限公司', 'E-005 部分比對誤中的「大有」被長名取代', by6['E-005'].winner);
+  check(j6.stats.solvedByLookup === 2, '解出件數不因重複命中而灌水', String(j6.stats.solvedByLookup));
+  check(calls.detail === d0, '全由反查解出，沒開內頁', `${d0} → ${calls.detail}`);
 }
 
 axios.get = realGet;
