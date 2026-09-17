@@ -1,7 +1,10 @@
 // expand_keywords 驗收。會打採購網清單端點（無驗證碼限制，約 15~25 次）；[3] 另需 GROQ_API_KEY（1 次呼叫）。
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 
+const registryHasKey = process.platform === 'win32' && (() => {
+  try { return /GROQ_API_KEY/.test(execFileSync('reg', ['query', String.raw`HKCU\Environment`, '/v', 'GROQ_API_KEY'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })); } catch { return false; }
+})();
 let pass = 0, fail = 0;
 const check = (ok, name, extra = '') => {
   if (ok) { pass++; console.log(`  PASS  ${name}${extra ? '  — ' + extra : ''}`); }
@@ -42,8 +45,13 @@ console.log('\n[2] 沒有金鑰：要 AI 時回說明；直接指定 terms 則�
 {
   const env = { ...process.env }; delete env.GROQ_API_KEY;
   await session(env, async ({ call }) => {
-    const noTerms = await call('expand_keywords', { topic: '室內裝修工程', source: 'tenders' });
-    check(noTerms.includes('GROQ_API_KEY') && noTerms.includes('terms'), '缺金鑰時說明可改用 terms', noTerms.slice(0, 30));
+    // Windows 使用者環境變數有金鑰時伺服器會從登錄檔讀到，模擬不出沒有金鑰（也避免真的去叫 AI）
+    if (registryHasKey) {
+      console.log('  SKIP  使用者環境變數已設 GROQ_API_KEY，無法模擬沒有金鑰');
+    } else {
+      const noTerms = await call('expand_keywords', { topic: '室內裝修工程', source: 'tenders' });
+      check(noTerms.includes('GROQ_API_KEY') && noTerms.includes('terms'), '缺金鑰時說明可改用 terms', noTerms.slice(0, 30));
+    }
     const bad = await call('expand_keywords', { topic: '工程技術服務', source: 'awards', from: '115/13/40', terms: ['監造'] });
     check(bad.includes('需要可解析的 from'), '日期錯誤在查詢前就擋下');
     const r = await call('expand_keywords', { topic: '室內裝修工程', source: 'tenders', terms: ['室內裝修', '裝潢'] });
@@ -61,8 +69,8 @@ console.log('\n[2] 沒有金鑰：要 AI 時回說明；直接指定 terms 則�
 }
 
 console.log('\n[3] 招標＋AI 產生詞（需要 GROQ_API_KEY）');
-if (!process.env.GROQ_API_KEY) {
-  check(false, '需要 GROQ_API_KEY 才能跑這段');
+if (!process.env.GROQ_API_KEY && !registryHasKey) {
+  check(false, '需要 GROQ_API_KEY（環境變數或 Windows 使用者環境變數）才能跑這段');
 } else {
   await session(process.env, async ({ call }) => {
     const r = await call('expand_keywords', { topic: '室內裝修工程', source: 'tenders', seeds: ['室內裝修'], maxTerms: 5 });

@@ -1,6 +1,6 @@
 // rank_by_topic 驗收。[4] 會實際呼叫 Groq（需 GROQ_API_KEY，約 3~6 次呼叫）；不碰採購網。
 // 對照組是 2026-09-17 實測 2,031 筆勞務決標時人工裁定過的公開標案名稱。
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import {
   keywordHits, groupOf, compareRank, createRankJob, loadRankJob, runRankJob, setRankState, rankCounts,
 } from './build/services/topic-rank.js';
@@ -59,7 +59,12 @@ check(groupOf({ score: 1, keywordHits: [] }) === 'C' && groupOf({ score: -1, key
 }
 
 console.log('\n[3] 沒有金鑰時 start 回明確說明、不建立工作');
-{
+// Windows 使用者環境變數有金鑰時，伺服器會從登錄檔讀到，模擬不出「沒有金鑰」
+const registryHasKey = process.platform === 'win32' && (() => {
+  try { return /GROQ_API_KEY/.test(execFileSync('reg', ['query', String.raw`HKCU\Environment`, '/v', 'GROQ_API_KEY'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })); } catch { return false; }
+})();
+if (registryHasKey) console.log('  SKIP  使用者環境變數已設 GROQ_API_KEY（伺服器會從登錄檔讀到），無法模擬沒有金鑰');
+else {
   const env = { ...process.env }; delete env.GROQ_API_KEY;
   const [r] = await rpc(env, [{ method: 'tools/call', params: { name: 'rank_by_topic', arguments: { action: 'start', topic: 'x', source: 'awards', from: '115/09/01' } } }]);
   const text = r?.result?.content?.[0]?.text ?? '';
@@ -85,8 +90,8 @@ const CASES = [
 ];
 
 console.log('\n[4] 實際呼叫 Groq：13 筆已知答案（批次 12＋單筆複查）');
-if (!process.env.GROQ_API_KEY) {
-  check(false, '需要 GROQ_API_KEY 才能跑這段');
+if (!process.env.GROQ_API_KEY && !registryHasKey) {
+  check(false, '需要 GROQ_API_KEY（環境變數或 Windows 使用者環境變數）才能跑這段');
 } else {
   const stamp = Date.now().toString(36);   // 避免撞到舊工作與分數快取
   const items = CASES.map(([org, name], i) => ({ pk: `SMOKE${stamp}${i}`, url: '', orgName: org, caseNo: `S${i}`, tenderName: `${name}（smoke ${stamp}）`, amount: 1000 - i, date: '115/09/17' }));

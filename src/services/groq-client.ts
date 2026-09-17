@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { execFileSync } from 'node:child_process';
 
 /**
  * Groq（OpenAI 相容 API）呼叫。只給 rank_by_topic／expand_keywords 用，其他工具不依賴它。
@@ -17,12 +18,34 @@ export class GroqError extends Error {
   }
 }
 
-export function hasGroqKey(): boolean {
-  return Boolean(process.env.GROQ_API_KEY?.trim());
+let registryKey: string | null | undefined;
+
+/**
+ * Claude Desktop 啟動 MCP 時只傳一小部分環境變數，使用者層級的 GROQ_API_KEY 進不來（2026-09-17 實測）。
+ * Windows 上退而讀 HKCU\Environment，金鑰就不必以明文寫進 MCP 設定檔。值只放記憶體，不輸出。
+ */
+function groqKey(): string | undefined {
+  const fromEnv = process.env.GROQ_API_KEY?.trim();
+  if (fromEnv) return fromEnv;
+  if (process.platform !== 'win32') return undefined;
+  if (registryKey === undefined) {
+    try {
+      const out = execFileSync('reg', ['query', String.raw`HKCU\Environment`, '/v', 'GROQ_API_KEY'], { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+      registryKey = out.match(/GROQ_API_KEY\s+REG_(?:EXPAND_)?SZ\s+(\S+)/)?.[1] ?? null;
+    } catch {
+      registryKey = null;
+    }
+  }
+  return registryKey ?? undefined;
 }
 
-export const NO_KEY_MESSAGE = '找不到環境變數 GROQ_API_KEY，這支工具需要 Groq 金鑰（其他工具不受影響）。'
-  + '請在系統使用者環境變數設定 GROQ_API_KEY，或在 MCP 設定檔這個 server 的 env 區塊加上它，然後完全關閉再重開 Claude。';
+export function hasGroqKey(): boolean {
+  return Boolean(groqKey());
+}
+
+export const NO_KEY_MESSAGE = '找不到 GROQ_API_KEY，這支工具需要 Groq 金鑰（其他工具不受影響）。'
+  + '已找過行程環境變數與 Windows 使用者環境變數（HKCU\\Environment）。請用 setx GROQ_API_KEY 設定後完全關閉再重開 Claude，'
+  + '或在 MCP 設定檔這個 server 的 env 區塊加上它。';
 
 export interface GroqUsage { calls: number; promptTokens: number; completionTokens: number; waitedMs: number }
 
@@ -34,7 +57,7 @@ const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 /** 送一次 prompt，回傳文字。429 依 retry-after 等待；超過 deadline（epoch ms）就丟 deadline 錯誤。 */
 export async function groqChat(prompt: string, usage: GroqUsage, opts: { maxTokens?: number; deadline?: number } = {}): Promise<string> {
-  const key = process.env.GROQ_API_KEY?.trim();
+  const key = groqKey();
   if (!key) throw new GroqError(NO_KEY_MESSAGE, 'no-key');
 
   for (let attempt = 1; ; attempt++) {
