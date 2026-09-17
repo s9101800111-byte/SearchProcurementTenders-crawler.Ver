@@ -20,6 +20,7 @@ import {
   createJob, loadJob, listJobs, runJob, setJobState, jobSummary, seedVendorsFromCache,
 } from "./services/resolve-service.js";
 import { rowsToExportCases, jobToExportCases, writeAwardsWorkbook, ExportCase } from "./services/award-excel.js";
+import { buildVendorProfile, splitRange, CountRow } from "./services/vendor-profile.js";
 
 const server = new McpServer({
   name: "taiwan-tender-searcher",
@@ -786,6 +787,102 @@ server.tool(
       return reply(out);
     } catch (error: any) {
       return reply(`匯出 Excel 失敗: ${error.message}`);
+    }
+  }
+);
+
+server.tool(
+  "vendor_profile",
+  `Profile ONE vendor over a period: cases won (count, total 決標金額, average, largest), cases bid on but lost and the resulting win rate, top agencies, counties (inferred from agency names), 標的分類 mix, monthly trend, and — from ALREADY-CACHED detail pages only — frequent co-bidders (how often they met, who won). Built on the listing endpoint (no CAPTCHA limit): each period segment costs ~2 requests (won + bid), and a period longer than ${MAX_RANGE_DAYS} days is split automatically and merged/deduplicated. Default period is the last 365 days (site data starts 112/07/01). Give a 統一編號 (8 digits, exact) whenever possible; a name is a PARTIAL match and can pull in other firms whose names contain it. CAVEATS to relay: (1) 決標金額 is the whole award, not this vendor's share in joint bids or multi-award contracts; (2) win rate counts award notices only (無法決標 cases are not in the bidder listing); (3) the competitor section never opens detail pages (they are CAPTCHA rate-limited) — coverage is reported as cached/total and flagged insufficient under 5 cases; run get_award_detail on the vendor's cases first to enrich it. Returns pre-formatted Markdown; output it verbatim.`,
+  {
+    vendor: z.string().min(1).describe("廠商統一編號（8 碼，精準，建議）或名稱（部分比對）"),
+    from: z.string().optional().describe("決標公告日起，預設一年前（不早於 112/07/01）；民國或西元皆可"),
+    to: z.string().optional().describe("決標公告日迄，預設今天"),
+    category: z.enum(["工程", "財物", "勞務"]).optional().describe("標的分類；不填＝全部"),
+    includeBids: z.boolean().optional().describe("是否查投標未得標（算得標率），預設 true，每段多 1 次請求"),
+    maxRowsPerSegment: z.number().int().min(1).max(2000).optional().describe("每段每種查詢最多幾列，預設 500"),
+    top: z.number().int().min(1).max(50).optional().describe("各排行列幾名，預設 10"),
+  },
+  async ({ vendor, from, to, category, includeBids, maxRowsPerSegment, top }) => {
+    const reply = (text: string) => ({ content: [{ type: "text" as const, text }] });
+    try {
+      const toN = to ? toROCNumber(to) : todayRocNumber();
+      if (toN == null || !isValidRocNumber(toN)) return reply(`日期格式無法解析：to="${to}"。請用 115/07/11 或 2026-07-11 這類格式。`);
+      let fromN: number;
+      if (from) {
+        const f = toROCNumber(from);
+        if (f == null || !isValidRocNumber(f)) return reply(`日期格式無法解析：from="${from}"。請用 115/07/11 或 2026-07-11 這類格式。`);
+        fromN = f;
+      } else {
+        const t = new Date(Date.UTC(Math.floor(toN / 10000) + 1911, Math.floor((toN % 10000) / 100) - 1, toN % 100 - 365));
+        fromN = (t.getUTCFullYear() - 1911) * 10000 + (t.getUTCMonth() + 1) * 100 + t.getUTCDate();
+      }
+      if (fromN > toN) return reply(`決標公告日起 ${formatROCNumber(fromN)} 晚於迄 ${formatROCNumber(toN)}，請對調。`);
+      if (toN < AWARD_DATA_START_ROC) return reply(`官網決標查詢只提供 112/07/01 之後的資料。`);
+      const notes: string[] = [];
+      if (fromN < AWARD_DATA_START_ROC) {
+        fromN = AWARD_DATA_START_ROC;
+        notes.push("起日早於官網資料下限，已改從 112/07/01 起算。");
+      }
+
+      const bids = includeBids ?? true;
+      const n = top ?? 10;
+      const p = await buildVendorProfile({ vendor, from: fromN, to: toN, category, includeBids: bids, maxRowsPerSegment: maxRowsPerSegment ?? 500 });
+      const fmt = (x: number) => x.toLocaleString("en-US");
+      const cell = (s: string) => String(s ?? "").replace(/\|/g, "\\|");
+      const segCount = splitRange(fromN, toN).length;
+
+      let out = `### 廠商側寫：${cell(p.vendor)}（${p.byId ? "統編" : "名稱部分比對"}）\n\n`;
+      out += `> 決標公告日 ${formatROCNumber(fromN)} ~ ${formatROCNumber(toN)}｜標的分類 ${category ?? "不限"}｜${segCount > 1 ? `分 ${segCount} 段查詢合併｜` : ""}清單端點 ${fmt(p.requests)} 次\n\n`;
+
+      if (p.won.length === 0 && p.lost.length === 0) {
+        out += `這段期間查不到${bids ? "得標或投標" : "得標"}紀錄。${p.byId ? "" : "名稱是部分比對，請確認寫法或改用統一編號。"}\n`;
+        if (p.errors.length) out += `\n> 查詢錯誤：${p.errors.join("；")}\n`;
+        return reply(out);
+      }
+
+      out += `#### 概況\n\n`;
+      out += `- **得標 ${fmt(p.won.length)} 件**｜決標金額合計 **${fmt(p.wonAmount)} 元**${p.wonAmountUnknown ? `（另有 ${p.wonAmountUnknown} 件金額未公開）` : ""}｜平均每件 ${fmt(Math.round(p.wonAmount / Math.max(1, p.won.length - p.wonAmountUnknown)))} 元\n`;
+      if (p.largest) out += `- 最大案：${cell(p.largest.orgName)}「${cell(p.largest.tenderName)}」${fmt(p.largest.amount ?? 0)} 元（${p.largest.awardNoticeDate}）\n`;
+      if (bids) out += `- 投標未得標 ${fmt(p.lost.length)} 件｜**得標率 ${p.winRate == null ? "—" : (p.winRate * 100).toFixed(1) + "%"}**（以決標公告計，不含無法決標）\n`;
+
+      const table = (title: string, rows: CountRow[], label: string) => {
+        if (!rows.length) return "";
+        let t = `\n#### ${title}\n\n| ${label} | 得標件數 | 得標金額 |${bids ? " 未得標件數 |" : ""}\n| :--- | ---: | ---: |${bids ? " ---: |" : ""}\n`;
+        for (const r of rows) t += `| ${cell(r.key)} | ${fmt(r.won)} | ${fmt(r.wonAmount)} |${bids ? ` ${fmt(r.lost)} |` : ""}\n`;
+        return t;
+      };
+      out += table(`主要往來機關（前 ${Math.min(n, p.orgs.length)} / 共 ${p.orgs.length} 個）`, p.orgs.slice(0, n), "機關");
+      out += table("縣市分布（由機關名稱推斷）", p.counties.slice(0, n), "縣市");
+      out += table("標的分類", p.categories, "分類");
+      out += table("月份趨勢（決標公告月）", p.months, "年/月");
+
+      out += `\n#### 常同場競標的對手\n\n`;
+      out += `內頁快取涵蓋 ${fmt(p.detailCoverage.cached)} / ${fmt(p.detailCoverage.total)} 件。`;
+      if (p.competitorInsufficient) {
+        out += `**快取案件不足 5 件，無法做有代表性的對手分析**。可先對這家的案子用 get_award_detail 抓內頁（受流量控制，10 分鐘 5 件）再重跑。\n`;
+      } else {
+        out += `只統計快取裡的案子，不代表全部。\n`;
+      }
+      if (p.competitors.length) {
+        out += `\n| 對手 | 統編 | 同場次數 | 對手得標 | 本廠商得標 |\n| :--- | :--- | ---: | ---: | ---: |\n`;
+        for (const c of p.competitors.slice(0, n)) out += `| ${cell(c.name)} | ${c.vendorId} | ${c.meetings} | ${c.theyWon} | ${c.weWon} |\n`;
+      }
+
+      if (p.won.length) {
+        out += `\n#### 最近得標（前 ${Math.min(n, p.won.length)} 件）\n\n| 決標公告日 | 機關 | 標案名稱 | 決標金額 |\n| :--- | :--- | :--- | ---: |\n`;
+        for (const r of p.won.slice(0, n)) out += `| ${r.awardNoticeDate} | ${cell(r.orgName)} | [${cell(r.tenderName)}](${r.url}) | ${r.amount == null ? "未公開" : fmt(r.amount)} |\n`;
+      }
+
+      if (!p.byId) notes.push("名稱是部分比對：名稱包含這串字的其他公司也會被算進來，要精準請改用 8 碼統一編號。");
+      notes.push("決標金額是整件決標金額，共同投標或複數決標時不是這家廠商的分得金額。");
+      if (p.truncated) notes.push("有區段結果超過 maxRowsPerSegment 被截斷，數字偏低；請提高上限或縮短期間。");
+      if (p.blocked) notes.push("查詢途中被官網擋下，後面的區段沒有查，數字不完整。");
+      if (p.errors.length) notes.push(`部分查詢失敗：${p.errors.join("；")}`);
+      out += `\n> ${notes.join("\n> ")}\n`;
+      return reply(out);
+    } catch (error: any) {
+      return reply(`廠商側寫失敗: ${error.message}`);
     }
   }
 );
