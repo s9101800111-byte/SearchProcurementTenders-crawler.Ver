@@ -17,7 +17,7 @@ import {
   DETAIL_WINDOW_MAX, DETAIL_WINDOW_MS, FULL_FIELDS_MAX_CASES,
 } from "./services/award-detail-crawler.js";
 import {
-  createJob, loadJob, listJobs, runJob, setJobState, jobSummary, seedVendorsFromCache,
+  createJob, loadJob, listJobs, runJob, setJobState, jobSummary, seedVendorsFromCache, setJobPriority, JobPriority,
 } from "./services/resolve-service.js";
 import { rowsToExportCases, jobToExportCases, writeAwardsWorkbook, ExportCase } from "./services/award-excel.js";
 import { buildVendorProfile, splitRange, CountRow } from "./services/vendor-profile.js";
@@ -152,12 +152,30 @@ server.tool(
   {
     cases: z.array(z.string()).min(1).describe("標案內頁連結（search_tenders 回傳的「查看」網址）或 pk 值，一次最多建議 8 筆"),
     full: z.boolean().optional().describe("true 則回傳內頁全部欄位（約 70 項），預設只回精選欄位"),
+    rankId: z.string().optional().describe("rank_by_topic 的 rankId（招標來源）：先把 cases 依 A→B→C 排序再抓，單次上限用在最相關的案子"),
   },
-  async ({ cases, full }) => {
+  async ({ cases, full, rankId }) => {
     try {
-      const { details, blocked, fetched } = await fetchTenderDetails(cases);
+      let ordered = cases;
+      let rankNote = "";
+      if (rankId) {
+        const rank = await loadRankJob(rankId);
+        if (!rank) return { content: [{ type: "text", text: `找不到排名 ${rankId}，用 rank_by_topic action="list" 查。` }] };
+        if (rank.source === "awards") return { content: [{ type: "text", text: `排名 ${rankId} 是決標案（source="awards"），決標 pk 與招標內頁不同編號空間，不能用在 get_tender_detail。` }] };
+        const byPk = new Map(rank.items.map(i => [i.pk, i]));
+        const order = { A: 0, B: 1, C: 2 } as const;
+        const keyed = cases.map((c, idx) => ({ c, idx, it: byPk.get(extractPk(c) ?? "") }));
+        // 不在排名裡的排在 B 之後、C 之前；同組分數高先，其餘保持原順序
+        const rankOf = (x: typeof keyed[number]) => x.it ? order[x.it.group ?? "C"] : 1.5;
+        keyed.sort((a, b) => rankOf(a) - rankOf(b) || (b.it?.score ?? -1) - (a.it?.score ?? -1) || a.idx - b.idx);
+        ordered = keyed.map(x => x.c);
+        const cnt = { A: 0, B: 0, C: 0, none: 0 };
+        for (const x of keyed) { if (x.it) cnt[x.it.group ?? "C"]++; else cnt.none++; }
+        rankNote = `> 依排名 \`${rankId}\`（${rank.topic}）排序後抓取：A ${cnt.A}／B ${cnt.B}／C ${cnt.C}${cnt.none ? `／不在排名 ${cnt.none}` : ""}${cases.length > MAX_FETCH_PER_CALL ? `｜單次最多抓 ${MAX_FETCH_PER_CALL} 筆未快取的案子，排在後面的會列為未取得` : ""}\n\n`;
+      }
+      const { details, blocked, fetched } = await fetchTenderDetails(ordered);
 
-      let out = `### 標案內頁明細（${details.length} 筆）\n\n`;
+      let out = `### 標案內頁明細（${details.length} 筆）\n\n${rankNote}`;
       const failed: typeof details = [];
 
       details.forEach((d, i) => {
@@ -576,8 +594,10 @@ server.tool(
     label: z.string().optional().describe("start 用：工作名稱，方便之後辨識"),
     maxCases: z.number().int().min(1).max(3000).optional().describe("start 用：案件數上限，預設 1000"),
     directory: z.enum(["off", "local", "all"]).optional().describe("start 用：名錄反查範圍。local＝只掃案件所在縣市登記的公司（預設，性價比最高）｜all＝在地掃完再掃全國（多數千次查詢、數小時）｜off＝不用名錄"),
+    rankId: z.string().optional().describe("start 用：rank_by_topic 的 rankId（決標來源）。內頁改依 A→B→C 順序抓（組內分數高、金額大的先）；可對既有 jobId 加掛。免費反查不受影響"),
+    skipGroupC: z.boolean().optional().describe("start 用：搭配 rankId，true＝C 組不開內頁（仍會被免費反查解出），預設 false"),
   },
-  async ({ action, jobId, from, to, category, counties, includeOther, cases, label, maxCases, directory }) => {
+  async ({ action, jobId, from, to, category, counties, includeOther, cases, label, maxCases, directory, rankId, skipGroupC }) => {
     const reply = (text: string) => ({ content: [{ type: "text" as const, text }] });
     try {
       if (action === "list") {
@@ -635,6 +655,17 @@ server.tool(
       }
 
       // ---- start ----
+      // 排名先驗證，免得清單查完、工作建好才發現 rankId 不能用
+      let priority: JobPriority | undefined;
+      if (skipGroupC && !rankId) return reply(`skipGroupC 要搭配 rankId 使用。`);
+      if (rankId) {
+        const rank = await loadRankJob(rankId);
+        if (!rank) return reply(`找不到排名 ${rankId}，用 rank_by_topic action="list" 查。`);
+        if (rank.source === "tenders") return reply(`排名 ${rankId} 是招標案（source="tenders"），pk 與決標公告不同編號空間，不能用在補得標廠商；請用決標來源重新排名。`);
+        if (rank.state !== "done") return reply(`排名 ${rankId} 還沒完成（${rank.state}：${rank.message}），分組會再變動，請等完成後再掛上。`);
+        priority = { rankId, topic: rank.topic, skipGroupC: Boolean(skipGroupC), ranks: Object.fromEntries(rank.items.map(i => [i.pk, { group: i.group ?? "C", score: i.score }])) };
+      }
+
       let job = jobId ? await loadJob(jobId) : null;
       if (!job) {
         const fromN = from ? toROCNumber(from) : null;
@@ -678,6 +709,14 @@ server.tool(
         });
       }
 
+      let rankNote = "";
+      if (priority) {
+        job = (await setJobPriority(job.id, priority)) ?? job;
+        const matched = job.cases.filter(c => priority!.ranks[c.pk]).length;
+        rankNote = `\n> 已掛上排名 \`${priority.rankId}\`：${matched}/${job.cases.length} 件在排名裡${matched < job.cases.length ? "（其餘排在 B 組之後、C 組之前）" : ""}${priority.skipGroupC ? "；C 組不開內頁" : ""}。`;
+        if (matched === 0) rankNote += `**沒有任何案子對得上排名，順序等同沒掛**——請確認排名與這個工作是同一批決標案。`;
+      }
+
       const started = await setJobState(job.id, "running");
       // 背景跑，不阻塞這次呼叫；狀態都落在工作檔裡，用 action="status" 查
       void runJob(job.id).catch(async (e: any) => {
@@ -685,7 +724,7 @@ server.tool(
         if (j) { j.state = "error"; j.message = `執行失敗：${e.message}`; await setJobState(j.id, "paused"); }
       });
 
-      return reply(`### 已啟動補廠商工作 \`${job.id}\`\n\n${jobSummary(started ?? job)}\n\n> 種子廠商 ${job.vendorQueue.length} 家（來自先前抓過的內頁快取），先做免費反查，再用名錄反查（${job.directory?.mode ?? "off"}），最後用內頁補剩下的。名錄掃描一家約 2 秒，在地名錄通常一千多家、約 1 小時。\n> 用 \`action="status", jobId="${job.id}"\` 查進度；\`action="result"\` 取結果與匯出檔；\`action="stop"\` 暫停。\n> 這個工作跑在 MCP 伺服器行程裡：重開 Claude 會中斷，再用同一個 jobId 執行 start 即可續跑，已解出的不會重查。`);
+      return reply(`### 已啟動補廠商工作 \`${job.id}\`\n\n${jobSummary(started ?? job)}\n\n> 種子廠商 ${job.vendorQueue.length} 家（來自先前抓過的內頁快取），先做免費反查，再用名錄反查（${job.directory?.mode ?? "off"}），最後用內頁補剩下的。名錄掃描一家約 2 秒，在地名錄通常一千多家、約 1 小時。${rankNote}\n> 用 \`action="status", jobId="${job.id}"\` 查進度；\`action="result"\` 取結果與匯出檔；\`action="stop"\` 暫停。\n> 這個工作跑在 MCP 伺服器行程裡：重開 Claude 會中斷，再用同一個 jobId 執行 start 即可續跑，已解出的不會重查。`);
     } catch (error: any) {
       return reply(`補廠商工作失敗: ${error.message}`);
     }

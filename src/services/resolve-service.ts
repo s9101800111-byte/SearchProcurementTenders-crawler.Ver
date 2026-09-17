@@ -81,7 +81,21 @@ export interface ResolveJob {
     total: number;
     tried: number;
   };
+  /** rank_by_topic 的排名：內頁依 A→B→C 抓；舊版工作檔沒有這欄，照金額排 */
+  priority?: JobPriority;
 }
+
+export interface JobPriority {
+  rankId: string;
+  topic: string;
+  /** true＝C 組不開內頁（免費反查照做） */
+  skipGroupC: boolean;
+  ranks: Record<string, { group: 'A' | 'B' | 'C'; score: number }>;
+}
+
+const GROUP_ORDER = { A: 0, B: 1, C: 2 } as const;
+/** 沒在排名裡的案子排在 B 與 C 之間：不知道相關性，不該被當成低分略過 */
+const UNRANKED = 1.5;
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 const nowIso = () => new Date().toISOString();
@@ -379,12 +393,13 @@ export async function runJob(id: string, opts: { maxMinutes?: number } = {}): Pr
       }
     }
 
-    // 3. 反查做完了，剩下的走內頁：金額大的先
-    const pending =job.cases.filter(c => c.status === 'unknown').sort((a, b) => (b.amount ?? 0) - (a.amount ?? 0));
+    // 3. 反查做完了，剩下的走內頁：有排名就 A→B→C（組內分數高、金額大的先），沒有就金額大的先
+    const { pending, skipped } = detailQueue(job);
     if (pending.length === 0) {
       recount(job);
       job.state = 'done';
-      job.message = `完成：已解 ${job.stats.resolved}/${job.stats.total}${job.stats.failed ? `，失敗 ${job.stats.failed}` : ''}`;
+      job.message = `完成：已解 ${job.stats.resolved}/${job.stats.total}${job.stats.failed ? `，失敗 ${job.stats.failed}` : ''}`
+        + (skipped ? `｜C 組 ${skipped} 件依 skipGroupC 設定未開內頁（仍未解）` : '');
       await saveJob(job);
       return;
     }
@@ -406,6 +421,31 @@ export async function runJob(id: string, opts: { maxMinutes?: number } = {}): Pr
     job.message = `內頁 ${pending[0].caseNo}：${outcome === 'ok' ? pending[0].winner : '失敗'}｜已解 ${job.stats.resolved}/${job.stats.total}`;
     await saveJob(job);
   }
+}
+
+/** 內頁待抓佇列；skipGroupC 時 C 組不進佇列 */
+export function detailQueue(job: ResolveJob): { pending: ResolveCase[]; skipped: number } {
+  const p = job.priority;
+  const order = (c: ResolveCase) => {
+    const r = p?.ranks[c.pk];
+    return r ? GROUP_ORDER[r.group] : UNRANKED;
+  };
+  const unknown = job.cases.filter(c => c.status === 'unknown');
+  const pending = unknown
+    .filter(c => !(p?.skipGroupC && p.ranks[c.pk]?.group === 'C'))
+    .sort((a, b) => !p
+      ? (b.amount ?? 0) - (a.amount ?? 0)
+      : order(a) - order(b) || (p.ranks[b.pk]?.score ?? -1) - (p.ranks[a.pk]?.score ?? -1) || (b.amount ?? 0) - (a.amount ?? 0));
+  return { pending, skipped: unknown.length - pending.length };
+}
+
+/** 掛上或更新排名（可對既有工作加掛，下一次抓內頁起生效） */
+export async function setJobPriority(id: string, priority: JobPriority | undefined): Promise<ResolveJob | null> {
+  const job = await loadJob(id);
+  if (!job) return null;
+  job.priority = priority;
+  await saveJob(job);
+  return job;
 }
 
 export async function setJobState(id: string, state: 'running' | 'paused'): Promise<ResolveJob | null> {
@@ -434,6 +474,11 @@ export function jobSummary(job: ResolveJob): string {
       + (job.directory && job.directory.mode !== 'off'
         ? `；名錄 ${job.directory.built ? `${fmt(job.directory.tried)}/${fmt(job.directory.total)} 家` : '尚未載入'}`
         : ''),
+    ...(job.priority ? [(() => {
+      const g = { A: 0, B: 0, C: 0, none: 0 };
+      for (const c of unknown) { const r = job.priority!.ranks[c.pk]; if (r) g[r.group]++; else g.none++; }
+      return `- 內頁順序：依排名 \`${job.priority.rankId}\`（${job.priority.topic}）A→B→C｜待解 A ${fmt(g.A)}／B ${fmt(g.B)}／C ${fmt(g.C)}${g.none ? `／不在排名 ${fmt(g.none)}（排在 B 之後）` : ''}${job.priority.skipGroupC ? '｜C 組不開內頁' : ''}`;
+    })()] : []),
     `- 更新時間 ${job.updatedAt}`,
   ].join('\n');
 }
