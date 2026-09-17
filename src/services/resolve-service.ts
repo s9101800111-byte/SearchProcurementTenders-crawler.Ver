@@ -5,7 +5,7 @@ import { AwardCategory, AwardRow } from '../types/award.js';
 import { queryAwards, awardDedupKey } from './award-service.js';
 import { fetchAwardDetails, AWARD_DETAIL_CACHE_FILE } from './award-detail-crawler.js';
 import { loadVendorDirectory, orderByLocality } from './vendor-directory.js';
-import { listCounties } from './award-locations.js';
+import { countyFromOrgName } from './award-locations.js';
 
 /**
  * 批次補得標廠商。
@@ -218,12 +218,10 @@ function mergeWinners(current: string | undefined, vendor: string): string {
 
 /** 從機關名稱推縣市（「臺中市政府水利局」→臺中市）；中央機關推不出來就略過 */
 function inferCounties(cases: ResolveCase[]): string[] {
-  const names = listCounties();
   const found = new Set<string>();
   for (const c of cases) {
-    const org = c.orgName.replace(/台/g, '臺');
-    const hit = names.find(n => org.startsWith(n) || org.startsWith(n.slice(0, 2)));
-    if (hit) found.add(hit);
+    const county = countyFromOrgName(c.orgName);
+    if (county) found.add(county);
   }
   return [...found];
 }

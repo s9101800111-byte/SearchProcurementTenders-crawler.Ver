@@ -107,6 +107,18 @@ function countyOfLabel(label: string): string | null {
   return LEGACY_COUNTY[head] ?? head;
 }
 
+/** 履約地點代碼 → 縣市（不限與「其他」回 null） */
+export function countyOfLocation(code: string): string | null {
+  return code ? countyOfLabel(locationLabel(code)) : null;
+}
+
+/** 從機關名稱推縣市（「臺中市政府水利局」→臺中市、「台中港」→臺中市）；中央機關推不出來回 null */
+export function countyFromOrgName(orgName: string): string | null {
+  const org = normalizeCountyName(orgName);
+  const names = [...COUNTY_CODES.keys()];
+  return names.find(n => org.startsWith(n)) ?? names.find(n => org.startsWith(n.slice(0, 2))) ?? null;
+}
+
 /** 縣市 → 該縣市全部代碼（依官網順序，舊制代碼在最後） */
 const COUNTY_CODES: Map<string, ExecLocationOption[]> = (() => {
   const m = new Map<string, ExecLocationOption[]>();

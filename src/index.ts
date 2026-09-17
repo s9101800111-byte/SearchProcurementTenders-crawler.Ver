@@ -19,6 +19,7 @@ import {
 import {
   createJob, loadJob, listJobs, runJob, setJobState, jobSummary, seedVendorsFromCache,
 } from "./services/resolve-service.js";
+import { rowsToExportCases, jobToExportCases, writeAwardsWorkbook, ExportCase } from "./services/award-excel.js";
 
 const server = new McpServer({
   name: "taiwan-tender-searcher",
@@ -674,6 +675,117 @@ server.tool(
       return reply(`### 已啟動補廠商工作 \`${job.id}\`\n\n${jobSummary(started ?? job)}\n\n> 種子廠商 ${job.vendorQueue.length} 家（來自先前抓過的內頁快取），先做免費反查，再用名錄反查（${job.directory?.mode ?? "off"}），最後用內頁補剩下的。名錄掃描一家約 2 秒，在地名錄通常一千多家、約 1 小時。\n> 用 \`action="status", jobId="${job.id}"\` 查進度；\`action="result"\` 取結果與匯出檔；\`action="stop"\` 暫停。\n> 這個工作跑在 MCP 伺服器行程裡：重開 Claude 會中斷，再用同一個 jobId 執行 start 即可續跑，已解出的不會重查。`);
     } catch (error: any) {
       return reply(`補廠商工作失敗: ${error.message}`);
+    }
+  }
+);
+
+server.tool(
+  "export_awards_excel",
+  `Export awarded cases to a multi-sheet Excel (.xlsx) report: 說明 (conditions, totals, caveats) / 明細 (every case, amounts as numbers, 案號 and 統編 as text, link column) / 縣市統計 / 機關排行 / 廠商排行 (only when vendor data exists; a multi-award case credits its full amount to each winner, stated in the sheet) / 金額級距. Two sources: (a) jobId of a resolve_award_vendors job — includes 得標廠商, 統編, 資料來源 and coverage; (b) a query (from/to/category/counties/includeOther/orgName/tenderName) run through the same listing search as search_awards — no vendor columns (the listing has none; use resolve_award_vendors first if vendors are needed). Counties come from 履約地點, and for the 「其他」 bucket, nationwide queries and resolve jobs they are inferred from the agency name (unrecognised → 「（未能判斷）」). The file goes to the project's .cache/exports/ unless outputDir (an EXISTING absolute folder) is given; existing files are never overwritten (a timestamp is appended). Same site limits as search_awards: data from 112/07/01, ≤${MAX_RANGE_DAYS} days per call, 決標公告日 ≠ 決標日. Returns Markdown with the absolute file path and a short summary; output it verbatim.`,
+  {
+    jobId: z.string().optional().describe("resolve_award_vendors 的工作 ID（有得標廠商欄）；給了就不用下面的查詢條件"),
+    from: z.string().optional().describe("決標公告日起（沒給 jobId 時必填）。民國或西元皆可：115/07/11、2026-07-11"),
+    to: z.string().optional().describe("決標公告日迄，預設今天"),
+    category: z.enum(["工程", "財物", "勞務"]).optional().describe("標的分類；不填＝全部"),
+    counties: z.array(z.string()).optional().describe("縣市名陣列（同 search_awards，自動展開全部代碼）；不填＝全國"),
+    includeOther: z.boolean().optional().describe("有給 counties 時是否加查「其他」桶，預設 false"),
+    orgName: z.string().optional().describe("機關名稱，部分比對"),
+    tenderName: z.string().optional().describe("標案名稱，部分比對"),
+    maxRows: z.number().int().min(1).max(5000).optional().describe("查詢模式最多幾列，預設 3000"),
+    outputDir: z.string().optional().describe("輸出資料夾（絕對路徑，必須已存在）；不填＝專案 .cache/exports/"),
+    fileName: z.string().optional().describe("檔名（不含路徑，可省略 .xlsx）；同名檔已存在時自動加時間戳，不覆蓋"),
+  },
+  async ({ jobId, from, to, category, counties, includeOther, orgName, tenderName, maxRows, outputDir, fileName }) => {
+    const reply = (text: string) => ({ content: [{ type: "text" as const, text }] });
+    try {
+      let cases: ExportCase[];
+      let meta: { title: string; conditions: [string, string][]; hasVendor: boolean };
+      const notes: string[] = [];
+
+      if (jobId) {
+        const job = await loadJob(jobId);
+        if (!job) return reply(`找不到補廠商工作 ${jobId}，用 resolve_award_vendors action="list" 查現有工作。`);
+        cases = jobToExportCases(job);
+        meta = {
+          title: `決標案件與得標廠商（${job.label}）`,
+          conditions: [
+            ["資料來源", `resolve_award_vendors 工作 ${job.id}`],
+            ["決標公告日", `${formatROCNumber(job.range.from)} ~ ${formatROCNumber(job.range.to)}`],
+            ["標的分類", job.range.category ?? "不限"],
+            ["工作狀態", `${job.state}｜${job.message}`],
+          ],
+          hasVendor: true,
+        };
+        if (job.state !== "done") notes.push(`工作尚未完成（${job.state}），未解出的案子得標廠商欄留空、資料來源標「未解出」。`);
+      } else {
+        if (!from) return reply(`需要 jobId（匯出補廠商結果）或 from（決標公告日起，匯出清單查詢結果）。`);
+        const fromN = toROCNumber(from);
+        const toN = to ? toROCNumber(to) : todayRocNumber();
+        if (fromN == null || !isValidRocNumber(fromN) || toN == null || !isValidRocNumber(toN)) {
+          return reply(`日期格式無法解析（from="${from}"${to ? `、to="${to}"` : ""}）。請用 115/07/11 或 2026-07-11 這類格式。`);
+        }
+        if (fromN > toN) return reply(`決標公告日起 ${formatROCNumber(fromN)} 晚於迄 ${formatROCNumber(toN)}，請對調。`);
+        if (toN < AWARD_DATA_START_ROC) return reply(`官網決標查詢只提供 112/07/01 之後的資料，查不到 ${formatROCNumber(fromN)} ~ ${formatROCNumber(toN)}。`);
+        const effFrom = Math.max(fromN, AWARD_DATA_START_ROC);
+        if (effFrom !== fromN) notes.push(`起日早於官網資料下限，已改從 112/07/01 起查。`);
+        const days = rocDaysBetween(effFrom, toN);
+        if (days > MAX_RANGE_DAYS) {
+          return reply(`決標公告日區間相差 ${days} 天，超過官網查詢上限 ${MAX_RANGE_DAYS} 天。請分段匯出。`);
+        }
+
+        let locations: ExecLocationOption[] = [{ code: "", label: "不限（全國）" }];
+        let scopeText = "全國（不限）";
+        if (counties && counties.some(c => c.trim())) {
+          const { groups, invalid } = resolveCounties(counties);
+          if (invalid.length > 0) {
+            const why = invalid.map(i => i.candidates.length > 0 ? `「${i.input}」有歧義：${i.candidates.join("／")}` : `「${i.input}」`).join("；");
+            return reply(`縣市名無法辨識：${why}。可用縣市：${listCounties().join("、")}`);
+          }
+          locations = groups.flatMap(g => g.locations);
+          scopeText = groups.map(g => g.county).join("、");
+          if (includeOther) {
+            locations.push({ code: OTHER_LOCATION_CODE, label: "其他" });
+            scopeText += "＋「其他」桶";
+          }
+        }
+
+        const r = await queryAwardsByLocations(
+          { from: effFrom, to: toN, category, orgName, tenderName, status: "決標" },
+          locations,
+          { maxRows: maxRows ?? 3000 },
+        );
+        if (!r.rows.length) return reply(`這個條件查不到決標案件${r.hasError ? "（部分查詢失敗，請稍後再試）" : ""}，沒有產出檔案。`);
+        if (r.truncated) notes.push(`結果超過 maxRows（${maxRows ?? 3000}）被截斷，官網共 ${r.siteTotal.toLocaleString("en-US")} 筆；請縮短區間或提高 maxRows。`);
+        if (r.hasError) notes.push(`部分履約地點代碼查詢失敗，資料可能不完整。`);
+        cases = rowsToExportCases(r.rows);
+        meta = {
+          title: "決標案件清單",
+          conditions: [
+            ["資料來源", "政府電子採購網 決標查詢（清單端點，無得標廠商欄）"],
+            ["決標公告日", `${formatROCNumber(effFrom)} ~ ${formatROCNumber(toN)}`],
+            ["標的分類", category ?? "不限"],
+            ["履約地點", scopeText],
+            ...(orgName ? [["機關名稱含", orgName] as [string, string]] : []),
+            ...(tenderName ? [["標案名稱含", tenderName] as [string, string]] : []),
+            ["官網總筆數", `${r.siteTotal.toLocaleString("en-US")}${r.siteTotalIsLowerBound ? "（下限）" : ""}；實抓去重 ${r.rows.length.toLocaleString("en-US")}`],
+          ],
+          hasVendor: false,
+        };
+      }
+
+      const res = await writeAwardsWorkbook(cases, meta, { outputDir, fileName });
+      const fmt = (n: number) => n.toLocaleString("en-US");
+      let out = `### 已匯出 Excel\n\n**檔案**：\`${res.path}\`\n\n`;
+      out += `- 案件 ${fmt(res.caseCount)} 件｜決標金額合計 ${fmt(res.totalAmount)} 元`;
+      if (res.vendorCoverage) out += `｜得標廠商 ${fmt(res.vendorCoverage.resolved)}/${fmt(res.vendorCoverage.total)} 件`;
+      out += `\n- 工作表：${res.sheets.map(s => `${s.name}（${fmt(s.rows)}）`).join("、")}\n`;
+      if (res.countyTop.length) out += `- 縣市（金額前 5）：${res.countyTop.slice(0, 5).map(c => `${c.county} ${fmt(c.count)} 件 ${fmt(c.amount)} 元`).join("；")}\n`;
+      if (res.orgTop.length) out += `- 機關（金額前 5）：${res.orgTop.slice(0, 5).map(o => `${o.org} ${fmt(o.count)} 件 ${fmt(o.amount)} 元`).join("；")}\n`;
+      if (res.vendorTop.length) out += `- 廠商（金額前 5，複數決標每家都計完整金額）：${res.vendorTop.slice(0, 5).map(v => `${v.vendor} ${fmt(v.count)} 件`).join("；")}\n`;
+      if (notes.length) out += `\n> ${notes.join("\n> ")}\n`;
+      return reply(out);
+    } catch (error: any) {
+      return reply(`匯出 Excel 失敗: ${error.message}`);
     }
   }
 );
