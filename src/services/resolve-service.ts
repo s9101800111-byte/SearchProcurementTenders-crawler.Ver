@@ -4,6 +4,8 @@ import { dirname, join } from 'node:path';
 import { AwardCategory, AwardRow } from '../types/award.js';
 import { queryAwards, awardDedupKey } from './award-service.js';
 import { fetchAwardDetails, AWARD_DETAIL_CACHE_FILE } from './award-detail-crawler.js';
+import { loadVendorDirectory, orderByLocality } from './vendor-directory.js';
+import { listCounties } from './award-locations.js';
 
 /**
  * 批次補得標廠商。
@@ -15,8 +17,9 @@ import { fetchAwardDetails, AWARD_DETAIL_CACHE_FILE } from './award-detail-crawl
  *
  * 所以這支的策略是：
  *   1) 反查（免費、不受流量控制）：用已知廠商名／統編反查，能解幾件算幾件
- *   2) 內頁（受限）：剩下的依決標金額由大到小逐案開，抓到新廠商名就丟回第 1 步
- * 兩者交替直到全部解完。跑很久，所以做成背景工作＋狀態落檔，可續跑、可查進度。
+ *   2) 名錄反查（免費但量大）：拿商工登記＋建築師名冊的公司全名逐一反查，在地廠商優先
+ *   3) 內頁（受限）：剩下的依決標金額由大到小逐案開，抓到新廠商名就丟回第 1 步
+ * 跑很久，所以做成背景工作＋狀態落檔，可續跑、可查進度。
  */
 
 // build 後此檔在 build/services/，狀態固定放專案根的 .cache/resolve-jobs/
@@ -30,7 +33,8 @@ const WINDOW_WAIT_MS = 60_000;
 /** 內頁被驗證碼擋住時的冷卻 */
 const BLOCK_WAIT_MS = 10 * 60_000;
 
-export type ResolveSource = '內頁完整' | '反查' | '快取';
+export type ResolveSource = '內頁完整' | '反查' | '名錄反查' | '快取';
+export type DirectoryMode = 'off' | 'local' | 'all';
 
 export interface ResolveCase {
   pk: string;
@@ -65,7 +69,18 @@ export interface ResolveJob {
   vendorQueue: string[];
   /** 已反查過的，不重複查 */
   triedVendors: string[];
-  stats: { total: number; resolved: number; failed: number; lookups: number; detailFetches: number; solvedByLookup: number; solvedByDetail: number };
+  stats: { total: number; resolved: number; failed: number; lookups: number; detailFetches: number; solvedByLookup: number; solvedByDetail: number; solvedByDirectory?: number };
+  /** 名錄反查；舊版工作檔沒有這欄，視同 off */
+  directory?: {
+    mode: DirectoryMode;
+    /** 判斷在地用的縣市 */
+    counties: string[];
+    built: boolean;
+    /** 待反查的名錄廠商（已排好在地優先） */
+    queue: { name: string; id: string }[];
+    total: number;
+    tried: number;
+  };
 }
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
@@ -137,6 +152,10 @@ export interface CreateJobInput {
   range: { from: number; to: number; category?: AwardCategory };
   rows: AwardRow[];
   seedVendors?: string[];
+  /** 預設 off（呼叫端要明確開啟，名錄動輒數千家） */
+  directory?: DirectoryMode;
+  /** 名錄在地優先用；不給就從機關名稱推 */
+  counties?: string[];
 }
 
 export async function createJob(input: CreateJobInput): Promise<ResolveJob> {
@@ -165,7 +184,15 @@ export async function createJob(input: CreateJobInput): Promise<ResolveJob> {
     cases,
     vendorQueue: [...new Set(input.seedVendors ?? [])],
     triedVendors: [],
-    stats: { total: cases.length, resolved: 0, failed: 0, lookups: 0, detailFetches: 0, solvedByLookup: 0, solvedByDetail: 0 },
+    stats: { total: cases.length, resolved: 0, failed: 0, lookups: 0, detailFetches: 0, solvedByLookup: 0, solvedByDetail: 0, solvedByDirectory: 0 },
+    directory: {
+      mode: input.directory ?? 'off',
+      counties: input.counties?.length ? input.counties : inferCounties(cases),
+      built: false,
+      queue: [],
+      total: 0,
+      tried: 0,
+    },
   };
   await saveJob(job);
   return job;
@@ -189,8 +216,24 @@ function mergeWinners(current: string | undefined, vendor: string): string {
   return names.filter(n => !names.some(m => m !== n && m.includes(n))).join(' / ');
 }
 
-/** 一次反查：用一個廠商名／統編查同區間的決標案，命中就標記 */
-async function lookupVendor(job: ResolveJob, vendor: string): Promise<number> {
+/** 從機關名稱推縣市（「臺中市政府水利局」→臺中市）；中央機關推不出來就略過 */
+function inferCounties(cases: ResolveCase[]): string[] {
+  const names = listCounties();
+  const found = new Set<string>();
+  for (const c of cases) {
+    const org = c.orgName.replace(/台/g, '臺');
+    const hit = names.find(n => org.startsWith(n) || org.startsWith(n.slice(0, 2)));
+    if (hit) found.add(hit);
+  }
+  return [...found];
+}
+
+/**
+ * 一次反查：用一個廠商名／統編查同區間的決標案，命中就標記。回傳新解出的件數。
+ * knownId：名錄帶來的統編，命中時一併記下。
+ */
+async function lookupVendor(job: ResolveJob, vendor: string, opts: { source?: ResolveSource; knownId?: string } = {}): Promise<number> {
+  const source = opts.source ?? '反查';
   const byId = /^\d{8}$/.test(vendor);
   const q = byId
     ? { from: job.range.from, to: job.range.to, category: job.range.category, gottenVendorId: vendor }
@@ -201,7 +244,8 @@ async function lookupVendor(job: ResolveJob, vendor: string): Promise<number> {
   if (r.error) return 0;
 
   // 已由反查解出的也要納入：複數決標案的每家得標廠商會各自命中同一案，只留第一家會漏
-  const open = job.cases.filter(c => c.status === 'unknown' || (c.status === 'resolved' && c.source === '反查'));
+  const open = job.cases.filter(c => c.status === 'unknown' || (c.status === 'resolved' && (c.source === '反查' || c.source === '名錄反查')));
+  const id = byId ? vendor : (opts.knownId || null);
   const byKey = new Map(open.map(c => [caseKey(c.orgName, c.caseNo), c]));
   const byPk = new Map(open.map(c => [c.pk, c]));
   let hit = 0;
@@ -211,15 +255,15 @@ async function lookupVendor(job: ResolveJob, vendor: string): Promise<number> {
     if (c.status === 'unknown') {
       c.status = 'resolved';
       c.winner = vendor;
-      c.winnerId = byId ? vendor : null;
-      c.source = '反查';
+      c.winnerId = id;
+      c.source = source;
       hit++;
       continue;
     }
     c.winner = mergeWinners(c.winner, vendor);
-    if (byId) c.winnerId = mergeWinners(c.winnerId ?? undefined, vendor);
+    // 先前的得標廠商沒有統編時不補，免得統編與名稱對不上
+    if (id && c.winnerId) c.winnerId = mergeWinners(c.winnerId, id);
   }
-  job.stats.solvedByLookup += hit;
   return hit;
 }
 
@@ -279,6 +323,7 @@ export async function runJob(id: string, opts: { maxMinutes?: number } = {}): Pr
       job.triedVendors.push(vendor);
       try {
         const hit = await lookupVendor(job, vendor);
+        job.stats.solvedByLookup += hit;
         recount(job);
         job.message = `反查「${vendor}」命中 ${hit} 件｜已解 ${job.stats.resolved}/${job.stats.total}`;
         await saveJob(job);
@@ -294,8 +339,50 @@ export async function runJob(id: string, opts: { maxMinutes?: number } = {}): Pr
       continue;
     }
 
-    // 2. 反查做完了，剩下的走內頁：金額大的先
-    const pending = job.cases.filter(c => c.status === 'unknown').sort((a, b) => (b.amount ?? 0) - (a.amount ?? 0));
+    // 2. 名錄反查：同樣免費，但一家一次查詢、動輒數千家，所以排在種子反查之後、內頁之前
+    const dir = job.directory;
+    if (dir && dir.mode !== 'off' && job.cases.some(c => c.status === 'unknown')) {
+      if (!dir.built) {
+        const loaded = await loadVendorDirectory();
+        const tried = new Set(job.triedVendors);
+        const { local, rest } = orderByLocality(loaded.entries.filter(e => !tried.has(e.name)), dir.counties);
+        // 推不出縣市時沒辦法分在地，只能全掃
+        const picked = dir.mode === 'local' && dir.counties.length ? local : [...local, ...rest];
+        dir.queue = picked.map(e => ({ name: e.name, id: e.id }));
+        dir.total = dir.queue.length;
+        dir.built = true;
+        job.message = `名錄 ${loaded.entries.length} 家${loaded.fromCache ? '（快取）' : ''}，本工作反查 ${dir.total} 家`
+          + `（${dir.mode === 'local' && dir.counties.length ? '只掃在地：' + dir.counties.join('、') : '全部'}）`
+          + (loaded.errors.length ? `｜名錄部分失敗：${loaded.errors.join('；')}` : '');
+        await saveJob(job);
+        continue;
+      }
+      const next = dir.queue.shift();
+      if (next) {
+        job.triedVendors.push(next.name);
+        dir.tried++;
+        try {
+          const hit = await lookupVendor(job, next.name, { source: '名錄反查', knownId: next.id });
+          job.stats.solvedByDirectory = (job.stats.solvedByDirectory ?? 0) + hit;
+          recount(job);
+          job.message = `名錄反查 ${dir.tried}/${dir.total}「${next.name}」命中 ${hit} 件｜已解 ${job.stats.resolved}/${job.stats.total}`;
+          await saveJob(job);
+        } catch (e: any) {
+          dir.queue.unshift(next);
+          dir.tried--;
+          job.triedVendors.pop();
+          job.message = `名錄反查暫停：${e.message}，${Math.round(BLOCK_WAIT_MS / 60000)} 分鐘後再試`;
+          await saveJob(job);
+          await sleep(BLOCK_WAIT_MS);
+          continue;
+        }
+        await sleep(LOOKUP_GAP_MS);
+        continue;
+      }
+    }
+
+    // 3. 反查做完了，剩下的走內頁：金額大的先
+    const pending =job.cases.filter(c => c.status === 'unknown').sort((a, b) => (b.amount ?? 0) - (a.amount ?? 0));
     if (pending.length === 0) {
       recount(job);
       job.state = 'done';
@@ -343,9 +430,12 @@ export function jobSummary(job: ResolveJob): string {
   return [
     `- 狀態：${job.state === 'running' ? '執行中' : job.state === 'done' ? '已完成' : job.state === 'paused' ? '已暫停' : '錯誤'}｜${job.message}`,
     `- 進度：${fmt(s.resolved)} / ${fmt(s.total)} 件（${pct}%）｜金額涵蓋 ${fmt(gotAmt)} / ${fmt(totalAmt)} 元`,
-    `- 來源：反查解出 ${fmt(s.solvedByLookup)} 件（免費）｜內頁解出 ${fmt(s.solvedByDetail)} 件（受流量控制）｜失敗 ${fmt(s.failed)} 件`,
+    `- 來源：反查解出 ${fmt(s.solvedByLookup)} 件（免費）｜名錄反查解出 ${fmt(s.solvedByDirectory ?? 0)} 件（免費）｜內頁解出 ${fmt(s.solvedByDetail)} 件（受流量控制）｜失敗 ${fmt(s.failed)} 件`,
     `- 連線：清單端點 ${fmt(s.lookups)} 次｜內頁 ${fmt(s.detailFetches)} 次`,
-    `- 待解 ${fmt(unknown.length)} 件；反查佇列尚有 ${fmt(job.vendorQueue.length)} 家廠商`,
+    `- 待解 ${fmt(unknown.length)} 件；反查佇列尚有 ${fmt(job.vendorQueue.length)} 家廠商`
+      + (job.directory && job.directory.mode !== 'off'
+        ? `；名錄 ${job.directory.built ? `${fmt(job.directory.tried)}/${fmt(job.directory.total)} 家` : '尚未載入'}`
+        : ''),
     `- 更新時間 ${job.updatedAt}`,
   ].join('\n');
 }

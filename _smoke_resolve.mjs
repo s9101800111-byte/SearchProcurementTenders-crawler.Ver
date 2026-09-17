@@ -14,7 +14,10 @@ const check = (ok, name, extra = '') => {
 };
 
 const realGet = axios.get;
-const calls = { list: 0, detail: 0 };
+const calls = { list: 0, detail: 0, gcis: 0, arch: 0 };
+// 名錄情境用（[7] 才放資料）
+const DIR_COMPANIES = [];
+const DIR_ARCH = [];
 
 // ---- 假資料：3 件案子，A/B 同一家廠商（反查一次可解兩件），C 另一家 ----
 const CASES = [
@@ -58,6 +61,17 @@ function install({ detailLimitAfter = 99 } = {}) {
       const pk = decodeURIComponent(new URL(url).searchParams.get('pkAtmMain') || '');
       const c = CASES.find(x => x.pk === pk);
       return c ? ok(detailPage(c)) : ok('<html>查無資料</html>');
+    }
+    if (url.includes('data.gcis.nat.gov.tw')) {
+      calls.gcis++;
+      const u = new URL(url);
+      const kw = (u.searchParams.get('$filter') || '').match(/like (.+?) and/)?.[1] ?? '';
+      const data = u.searchParams.get('$skip') === '0' ? DIR_COMPANIES.filter(c => c.Company_Name.includes(kw)) : [];
+      return { status: 200, data, headers: {} };
+    }
+    if (url.includes('quality.data.gov.tw')) {
+      calls.arch++;
+      return { status: 200, data: DIR_ARCH, headers: {} };
     }
     return realGet(url, cfg);
   };
@@ -163,6 +177,50 @@ console.log('\n[6]複數決標：每家得標廠商都要記下，部分比對�
   check(by6['E-005'].winner === '新大有工程顧問有限公司', 'E-005 部分比對誤中的「大有」被長名取代', by6['E-005'].winner);
   check(j6.stats.solvedByLookup === 2, '解出件數不因重複命中而灌水', String(j6.stats.solvedByLookup));
   check(calls.detail === d0, '全由反查解出，沒開內頁', `${d0} → ${calls.detail}`);
+}
+
+console.log('\n[7] 名錄反查：種子沒有的廠商靠名錄解出，只掃在地、帶回統編、名錄有快取');
+{
+  process.env.VENDOR_DIRECTORY_FILE = join(tmp, 'vendor-directory.json');
+  DIR_COMPANIES.push(
+    { Company_Name: '白虎工程顧問有限公司', Business_Accounting_NO: '66666666', Company_Location: '高雄市前鎮區測試路1號' },
+    { Company_Name: '青龍工程顧問有限公司', Business_Accounting_NO: '55555555', Company_Location: '台中市西屯區測試路2號' },
+  );
+  DIR_ARCH.push({ 事務所名稱: '麒麟建築師事務所', 事務所所在地: '臺北市信義區' });
+  const f = { pk: 'NzEyMDAwMDA2', caseNo: 'F-006', org: '臺中市政府測試局', name: '案子六', amount: 900000, vendor: '青龍工程顧問有限公司', vendorId: '55555555' };
+  EXTRA.push(f);
+  const rows7 = [{ pk: f.pk, linkType: 'atm', url: `https://web.pcc.gov.tw/prkms/urlSelector/common/atm?pk=${f.pk}`, orgName: f.org, caseNo: f.caseNo, isCorrection: false, tenderName: f.name, tenderWay: '', category: '勞務類', awardNoticeDate: '115/08/01', amount: f.amount, awardSeq: '001', nonAwardSeq: '', isNonAward: false, execLocation: '' }];
+  const fresh = async input => {
+    const j = await svc.createJob(input);
+    rmSync(join('.cache', 'resolve-jobs', `${j.id}.json`), { force: true });
+    return svc.createJob(input);
+  };
+
+  const d0 = calls.detail;
+  let j7 = await fresh({ label: '測試-名錄', range: { from: 1150711, to: 1150911, category: '勞務' }, rows: rows7, seedVendors: [], directory: 'local' });
+  await svc.setJobState(j7.id, 'running');
+  await svc.runJob(j7.id, { maxMinutes: 1 });
+  j7 = await svc.loadJob(j7.id);
+  const c7 = j7.cases[0];
+  check(JSON.stringify(j7.directory?.counties) === '["臺中市"]', '沒給縣市時由機關名稱推得', JSON.stringify(j7.directory?.counties));
+  check(j7.directory?.total === 1, '只掃在地：高雄、臺北的廠商不進佇列（地址寫「台中」也認得）', String(j7.directory?.total));
+  check(c7.winner === '青龍工程顧問有限公司' && c7.source === '名錄反查', 'F-006 由名錄反查解出', `${c7.winner}（${c7.source}）`);
+  check(c7.winnerId === '55555555', '名錄帶來的統編有記下', String(c7.winnerId));
+  check(j7.stats.solvedByDirectory === 1 && j7.stats.solvedByLookup === 0, '件數記在名錄反查，不混進種子反查', `${j7.stats.solvedByDirectory}/${j7.stats.solvedByLookup}`);
+  check(calls.gcis > 0 && calls.arch === 1 && calls.detail === d0, '名錄有抓、沒開內頁', `gcis=${calls.gcis} arch=${calls.arch} detail=${calls.detail - d0}`);
+
+  const g1 = calls.gcis, a1 = calls.arch;
+  let j8 = await fresh({ label: '測試-名錄全掃', range: { from: 1150711, to: 1150910, category: '勞務' }, rows: rows7, seedVendors: [], directory: 'all' });
+  await svc.setJobState(j8.id, 'running');
+  await svc.runJob(j8.id, { maxMinutes: 1 });
+  j8 = await svc.loadJob(j8.id);
+  check(j8.directory?.total === 3, 'all 模式：在地之外也排進佇列', String(j8.directory?.total));
+  check(j8.directory?.tried === 1 && j8.state === 'done', '案子解完就停，不把剩下的名錄硬掃完', `tried=${j8.directory?.tried} state=${j8.state}`);
+  check(calls.gcis === g1 && calls.arch === a1, '第二個工作沿用名錄快取，沒有重抓', `gcis ${g1}→${calls.gcis} arch ${a1}→${calls.arch}`);
+
+  let j9 = await fresh({ label: '測試-不用名錄', range: { from: 1150711, to: 1150909, category: '勞務' }, rows: rows7, seedVendors: [] });
+  check(j9.directory?.mode === 'off', 'createJob 沒指定時預設不用名錄（服務層保守預設，工具層才預設 local）', String(j9.directory?.mode));
+  rmSync(join('.cache', 'resolve-jobs', `${j9.id}.json`), { force: true });
 }
 
 axios.get = realGet;

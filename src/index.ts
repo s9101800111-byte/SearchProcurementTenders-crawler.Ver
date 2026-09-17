@@ -549,7 +549,7 @@ server.tool(
 
 server.tool(
   "resolve_award_vendors",
-  `Batch-resolve WINNING VENDORS for a whole set of awarded cases, working around the detail-page CAPTCHA rate limit. Runs as a BACKGROUND JOB with a persisted, resumable state file — start it, then poll with action="status"; it keeps going while this MCP server process lives (restarting Claude restarts the process, so re-run action="start" with the same jobId to resume). Strategy, alternating automatically: (1) FREE lookups — the same firm usually wins several cases, so every known vendor name/統編 is reverse-queried on the listing endpoint (no CAPTCHA limit), often resolving many cases per request; every vendor newly discovered from a detail page is queued for lookup too; (2) RATE-LIMITED detail pages — whatever is left is opened one by one, largest 決標金額 first, honouring the shared ${DETAIL_WINDOW_MAX}-requests-per-${DETAIL_WINDOW_MS / 60000}-minutes budget, so the valuable cases land first and the job survives being interrupted. Measured on a real 341-case batch: detail pages alone would take ~14 h; with lookups most cases resolve in a fraction of that. action="start" takes either explicit cases (pk/links) or a query (from/to/category/counties) that it runs through the same search as search_awards. action="result" returns the table and writes CSV+JSON under .cache/exports/. NOTE: lookup-resolved rows give the vendor name (and 統編 when looked up by id) but NOT 投標家數/落標廠商/預算/減標率 — those only come from the detail page; the 資料來源 column says which is which.`,
+  `Batch-resolve WINNING VENDORS for a whole set of awarded cases, working around the detail-page CAPTCHA rate limit. Runs as a BACKGROUND JOB with a persisted, resumable state file — start it, then poll with action="status"; it keeps going while this MCP server process lives (restarting Claude restarts the process, so re-run action="start" with the same jobId to resume). Strategy, alternating automatically: (1) FREE lookups — the same firm usually wins several cases, so every known vendor name/統編 is reverse-queried on the listing endpoint (no CAPTCHA limit), often resolving many cases per request; every vendor newly discovered from a detail page is queued for lookup too; (2) DIRECTORY lookups (directory param, default "local") — full legal names from the MOEA company registry (工程顧問/技術顧問/景觀/工程設計/環境工程/測量) plus the architect-office roster are reverse-queried one per request, firms registered in the cases' counties first; "local" scans only those (measured: 1,605 local firms resolved 110 of 221 leftover cases in ~55 min, while the other ~5,600 firms would add ~3 h for ~20-40 more), "all" continues nationwide, "off" skips; the directory is cached 7 days; 技師事務所 have no open roster so they still need detail pages; (3) RATE-LIMITED detail pages — whatever is left is opened one by one, largest 決標金額 first, honouring the shared ${DETAIL_WINDOW_MAX}-requests-per-${DETAIL_WINDOW_MS / 60000}-minutes budget, so the valuable cases land first and the job survives being interrupted. Measured on a real 341-case batch: detail pages alone would take ~14 h; with lookups most cases resolve in a fraction of that. action="start" takes either explicit cases (pk/links) or a query (from/to/category/counties) that it runs through the same search as search_awards. action="result" returns the table and writes CSV+JSON under .cache/exports/. NOTE: lookup-resolved rows give the vendor name (and 統編 when looked up by id) but NOT 投標家數/落標廠商/預算/減標率 — those only come from the detail page; the 資料來源 column says which is which.`,
   {
     action: z.enum(["start", "status", "stop", "result", "list"]).describe("start=建立或續跑工作｜status=查進度｜stop=暫停｜result=取結果與匯出｜list=列出所有工作"),
     jobId: z.string().optional().describe("status／stop／result 必填；start 帶上則續跑該工作"),
@@ -561,8 +561,9 @@ server.tool(
     cases: z.array(z.string()).optional().describe("start 用：直接給決標公告連結或 pk（給了就不另外查清單）"),
     label: z.string().optional().describe("start 用：工作名稱，方便之後辨識"),
     maxCases: z.number().int().min(1).max(3000).optional().describe("start 用：案件數上限，預設 1000"),
+    directory: z.enum(["off", "local", "all"]).optional().describe("start 用：名錄反查範圍。local＝只掃案件所在縣市登記的公司（預設，性價比最高）｜all＝在地掃完再掃全國（多數千次查詢、數小時）｜off＝不用名錄"),
   },
-  async ({ action, jobId, from, to, category, counties, includeOther, cases, label, maxCases }) => {
+  async ({ action, jobId, from, to, category, counties, includeOther, cases, label, maxCases, directory }) => {
     const reply = (text: string) => ({ content: [{ type: "text" as const, text }] });
     try {
       if (action === "list") {
@@ -658,6 +659,8 @@ server.tool(
           range: { from: rangeFrom, to: rangeTo, category },
           rows,
           seedVendors: seeds,
+          directory: directory ?? "local",
+          counties,
         });
       }
 
@@ -668,7 +671,7 @@ server.tool(
         if (j) { j.state = "error"; j.message = `執行失敗：${e.message}`; await setJobState(j.id, "paused"); }
       });
 
-      return reply(`### 已啟動補廠商工作 \`${job.id}\`\n\n${jobSummary(started ?? job)}\n\n> 種子廠商 ${job.vendorQueue.length} 家（來自先前抓過的內頁快取），先做免費反查，再用內頁補剩下的。\n> 用 \`action="status", jobId="${job.id}"\` 查進度；\`action="result"\` 取結果與匯出檔；\`action="stop"\` 暫停。\n> 這個工作跑在 MCP 伺服器行程裡：重開 Claude 會中斷，再用同一個 jobId 執行 start 即可續跑，已解出的不會重查。`);
+      return reply(`### 已啟動補廠商工作 \`${job.id}\`\n\n${jobSummary(started ?? job)}\n\n> 種子廠商 ${job.vendorQueue.length} 家（來自先前抓過的內頁快取），先做免費反查，再用名錄反查（${job.directory?.mode ?? "off"}），最後用內頁補剩下的。名錄掃描一家約 2 秒，在地名錄通常一千多家、約 1 小時。\n> 用 \`action="status", jobId="${job.id}"\` 查進度；\`action="result"\` 取結果與匯出檔；\`action="stop"\` 暫停。\n> 這個工作跑在 MCP 伺服器行程裡：重開 Claude 會中斷，再用同一個 jobId 執行 start 即可續跑，已解出的不會重查。`);
     } catch (error: any) {
       return reply(`補廠商工作失敗: ${error.message}`);
     }
