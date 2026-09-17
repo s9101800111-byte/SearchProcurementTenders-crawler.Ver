@@ -25,7 +25,11 @@ import { extractPk } from "./services/detail-crawler.js";
 import { hasGroqKey, NO_KEY_MESSAGE } from "./services/groq-client.js";
 import {
   createRankJob, loadRankJob, listRankJobs, runRankJob, setRankState, rankSummary, rankCounts, compareRank, RankItem, BATCH_SIZE, MAX_RECHECK,
+  suggestTerms,
 } from "./services/topic-rank.js";
+import { newUsage } from "./services/groq-client.js";
+import { AwardRow } from "./types/award.js";
+import { awardDedupKey } from "./services/award-service.js";
 import { readFile as readFileAsync, mkdir as mkdirAsync, writeFile as writeFileAsync } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname as pathDirname, join as pathJoin, isAbsolute } from "node:path";
@@ -1052,6 +1056,184 @@ server.tool(
       return reply(`### 已啟動主題排名 \`${job.id}\`\n\n${rankSummary(started ?? job)}\n\n> 背景執行中，用 \`action="status", rankId="${job.id}"\` 查進度、\`action="result"\` 取結果。每 ${BATCH_SIZE} 筆一批，被 Groq 限速時自動等待；重開 Claude 會中斷，用同一個 rankId 再 start 即可續跑（已評分的不重算）。`);
     } catch (error: any) {
       return reply(`主題排名失敗: ${error.message}`);
+    }
+  }
+);
+
+server.tool(
+  "expand_keywords",
+  `Widen a NAME-keyword search with synonyms: tender-name matching misses cases worded differently (「室內裝修」 vs 「裝潢」「內裝」「整修」). An LLM on Groq (env GROQ_API_KEY) proposes up to maxTerms terms for the topic — skipped entirely if you pass terms yourself — then EVERY term is queried on the real site listing and the results are merged and deduplicated. Only the term list is AI-generated; every returned row is real site data, so values cannot be wrong, but a broad term can pull in unrelated cases. Output: per-term table (命中筆數, 只靠這個詞才找到的筆數, errors/truncation — use it to drop useless or too-broad terms), the merged table with which terms matched each row, and a JSON/CSV export (for source="awards" the JSON is the same format as search_awards, so it can go straight into rank_by_topic exportFile). source="tenders" = open-for-bidding tenders (search_tenders scope; each term ≈1~5 listing requests); source="awards" = awarded cases (search_awards scope, same date/category/county filters; each term costs one or more requests PER 履約地點 code, ≥1.5 s apart — 10 terms × 4 counties can take several minutes). The listing endpoints have no CAPTCHA limit; detail pages are never opened. Output Markdown verbatim.`,
+  {
+    topic: z.string().min(2).describe("要找的主題，例：「室內裝修工程」"),
+    source: z.enum(["tenders", "awards"]).describe("tenders＝等標期內招標案｜awards＝決標案"),
+    seeds: z.array(z.string()).optional().describe("一定要查的詞（使用者自己的關鍵字），會和 AI 產生的詞一起查"),
+    terms: z.array(z.string()).optional().describe("直接指定要查的詞，給了就不呼叫 AI（例如刪掉上一次太寬的詞後重查）"),
+    maxTerms: z.number().int().min(1).max(15).optional().describe("AI 最多產生幾個詞，預設 8"),
+    orgName: z.string().optional().describe("機關名稱部分比對（兩種來源都可用）"),
+    publishFrom: z.string().optional().describe("tenders：公告日起"),
+    publishTo: z.string().optional().describe("tenders：公告日迄"),
+    deadlineFrom: z.string().optional().describe("tenders：截止投標日起"),
+    deadlineTo: z.string().optional().describe("tenders：截止投標日迄"),
+    from: z.string().optional().describe("awards：決標公告日起（必填）"),
+    to: z.string().optional().describe("awards：決標公告日迄，預設今天"),
+    category: z.enum(["工程", "財物", "勞務"]).optional().describe("awards：標的分類"),
+    counties: z.array(z.string()).optional().describe("awards：縣市（自動展開全部履約地點代碼）"),
+    includeOther: z.boolean().optional().describe("awards：加查「其他」桶"),
+    maxRowsPerTerm: z.number().int().min(1).max(3000).optional().describe("awards：每個詞最多取幾列，預設 500"),
+    previewRows: z.number().int().min(0).max(300).optional().describe("合併表格最多列幾筆，預設 40"),
+  },
+  async (args) => {
+    const reply = (text: string) => ({ content: [{ type: "text" as const, text }] });
+    const fmt = (n: number) => n.toLocaleString("en-US");
+    const cell = (s: string) => String(s ?? "").replace(/\|/g, "\\|").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const clean = (list?: string[]) => (list ?? []).map(s => s.trim()).filter(s => s.length >= 1);
+    try {
+      // ---- 查詢條件先驗證，免得 AI 額度花了才發現日期錯 ----
+      let awardBase: { from: number; to: number; locations: ExecLocationOption[]; scope: string } | null = null;
+      let tenderFilter: { publishFrom: number | null; publishTo: number | null; deadlineFrom: number | null; deadlineTo: number | null } | null = null;
+      if (args.source === "awards") {
+        const fromN = args.from ? toROCNumber(args.from) : null;
+        const toN = args.to ? toROCNumber(args.to) : todayRocNumber();
+        if (fromN == null || !isValidRocNumber(fromN) || toN == null || !isValidRocNumber(toN)) return reply(`source="awards" 需要可解析的 from（與 to），例：115/07/11 或 2026-07-11。`);
+        if (fromN > toN) return reply(`決標公告日起晚於迄，請對調。`);
+        const effFrom = Math.max(fromN, AWARD_DATA_START_ROC);
+        if (rocDaysBetween(effFrom, toN) > MAX_RANGE_DAYS) return reply(`決標公告日區間超過官網上限 ${MAX_RANGE_DAYS} 天，請分段。`);
+        let locations: ExecLocationOption[] = [{ code: "", label: "不限（全國）" }];
+        let scope = "全國";
+        if (args.counties?.some(c => c.trim())) {
+          const { groups, invalid } = resolveCounties(args.counties);
+          if (invalid.length) return reply(`縣市名無法辨識：${invalid.map(i => i.input).join("、")}。可用：${listCounties().join("、")}`);
+          locations = groups.flatMap(g => g.locations);
+          scope = groups.map(g => g.county).join("、");
+          if (args.includeOther) { locations.push({ code: OTHER_LOCATION_CODE, label: "其他" }); scope += "＋其他"; }
+        }
+        awardBase = { from: effFrom, to: toN, locations, scope };
+      } else {
+        const raw = { publishFrom: args.publishFrom, publishTo: args.publishTo, deadlineFrom: args.deadlineFrom, deadlineTo: args.deadlineTo };
+        tenderFilter = { publishFrom: toROCNumber(raw.publishFrom), publishTo: toROCNumber(raw.publishTo), deadlineFrom: toROCNumber(raw.deadlineFrom), deadlineTo: toROCNumber(raw.deadlineTo) };
+        const bad = (Object.keys(raw) as (keyof typeof raw)[]).filter(k => raw[k] && tenderFilter![k] == null);
+        if (bad.length) return reply(`日期格式無法解析：${bad.map(k => `${k}="${raw[k]}"`).join("、")}。`);
+      }
+
+      // ---- 詞表 ----
+      const origin = new Map<string, string>();
+      for (const s of clean(args.seeds)) origin.set(s, "自訂");
+      const usage = newUsage();
+      const redundant: string[] = [];
+      if (args.terms?.length) {
+        for (const s of clean(args.terms)) if (!origin.has(s)) origin.set(s, "指定");
+      } else {
+        if (!hasGroqKey()) return reply(NO_KEY_MESSAGE + `\n\n（不想用 AI 的話，可以直接用 terms 參數指定要查的詞。）`);
+        const ai = await suggestTerms(args.topic, args.maxTerms ?? 8, usage);
+        // 查詢是名稱子字串比對：「室內裝修工程」能找到的「室內裝修」一定也找得到，查了是白花請求。
+        // 只略過 AI 詞；使用者自己給的詞一律照查
+        const shortestFirst = [...new Set(ai)].sort((a, b) => a.length - b.length);
+        for (const s of shortestFirst) {
+          if (origin.has(s)) continue;
+          if ([...origin.keys()].some(k => s.includes(k))) { redundant.push(s); continue; }
+          origin.set(s, "AI");
+        }
+        if (!ai.length && !origin.size) return reply(`AI 沒有產生可用的詞，請改用 terms 參數直接指定。`);
+      }
+      const termList = [...origin.keys()];
+
+      // ---- 逐詞查詢 ----
+      type Hit = { key: string; row: any; terms: string[] };
+      const merged = new Map<string, Hit>();
+      const stats: { term: string; hits: number; siteTotal: number | null; note: string }[] = [];
+      let requests = 0;
+      let stopped = false;
+      for (const term of termList) {
+        if (stopped) { stats.push({ term, hits: 0, siteTotal: null, note: "未查（前面查詢失敗或被擋）" }); continue; }
+        let rows: { key: string; row: any }[] = [];
+        let note = "";
+        let siteTotal: number | null = null;
+        if (awardBase) {
+          const r = await queryAwardsByLocations({ from: awardBase.from, to: awardBase.to, category: args.category, orgName: args.orgName, tenderName: term, status: "決標" }, awardBase.locations, { maxRows: args.maxRowsPerTerm ?? 500 });
+          requests += r.requests;
+          rows = r.rows.map(x => ({ key: awardDedupKey(x), row: x }));
+          siteTotal = r.siteTotal;
+          if (r.truncated) note = `已截斷（官網 ${fmt(r.siteTotal)} 筆）`;
+          if (r.hasError) { note = [note, "部分代碼查詢失敗"].filter(Boolean).join("；"); if (r.perLocation.some(p => p.skipped)) stopped = true; }
+        } else {
+          const t = await fetchAndFilterTenders(term, tenderFilter!, args.orgName);
+          requests += 1;
+          rows = t.results.map(x => ({ key: extractPk(x.link) ?? `${x.orgName}||${x.caseId}`, row: x }));
+          if (t.hasMore) note = "官網超過 500 筆，已截斷";
+        }
+        for (const { key, row } of rows) {
+          const h = merged.get(key);
+          if (h) { if (!h.terms.includes(term)) h.terms.push(term); } else merged.set(key, { key, row, terms: [term] });
+        }
+        stats.push({ term, hits: rows.length, siteTotal, note });
+      }
+
+      const all = [...merged.values()];
+      const uniqueOnly = (term: string) => all.filter(h => h.terms.length === 1 && h.terms[0] === term).length;
+      const seedTerms = termList.filter(t => origin.get(t) === "自訂");
+      const bySeeds = seedTerms.length ? all.filter(h => h.terms.some(t => seedTerms.includes(t))).length : 0;
+
+      let out = `### 同義詞擴充查詢「${cell(args.topic)}」：合併 ${fmt(all.length)} 筆\n\n`;
+      out += `> 來源：${awardBase ? `決標案｜決標公告日 ${formatROCNumber(awardBase.from)}~${formatROCNumber(awardBase.to)}｜分類 ${args.category ?? "不限"}｜${awardBase.scope}` : "等標期內招標案"}${args.orgName ? `｜機關含「${cell(args.orgName)}」` : ""}\n`;
+      out += `> 詞表 ${termList.length} 個（AI ${termList.filter(t => origin.get(t) === "AI").length}／自訂 ${seedTerms.length}／指定 ${termList.filter(t => origin.get(t) === "指定").length}）｜清單查詢約 ${fmt(requests)} 次${usage.calls ? `｜Groq ${usage.calls} 次` : ""}\n\n`;
+      if (seedTerms.length) out += `**只用自訂關鍵字會找到 ${fmt(bySeeds)} 筆；加上其他詞後多出 ${fmt(all.length - bySeeds)} 筆。**\n\n`;
+      if (redundant.length) out += `> 略過 ${redundant.length} 個 AI 詞（包含了清單裡較短的詞，查了也不會多找到）：${redundant.map(cell).join("、")}\n\n`;
+
+      out += `| 詞 | 來源 | 命中 | 只靠這個詞才找到 | 備註 |\n| :--- | :--- | ---: | ---: | :--- |\n`;
+      for (const s of stats) {
+        const broad = s.hits >= 300 ? "命中很多，可能太寬" : "";
+        out += `| ${cell(s.term)} | ${origin.get(s.term)} | ${fmt(s.hits)} | ${fmt(uniqueOnly(s.term))} | ${[s.note, broad].filter(Boolean).join("；")} |\n`;
+      }
+
+      const preview = args.previewRows ?? 40;
+      if (all.length) {
+        const sorted = awardBase
+          ? all.sort((a, b) => String(b.row.awardNoticeDate).localeCompare(String(a.row.awardNoticeDate)))
+          : all.sort((a, b) => String(a.row.deadline).localeCompare(String(b.row.deadline)));
+        out += `\n#### 合併結果（前 ${Math.min(preview, sorted.length)} 筆）\n\n`;
+        if (awardBase) {
+          out += `| 決標公告日 | 機關 | 案號 | 標案名稱 | 決標金額 | 命中的詞 | 連結 |\n| :--- | :--- | :--- | :--- | ---: | :--- | :--- |\n`;
+          for (const h of sorted.slice(0, preview)) {
+            const x: AwardRow = h.row;
+            out += `| ${x.awardNoticeDate} | ${cell(x.orgName)} | ${cell(x.caseNo)} | ${cell(x.tenderName)} | ${x.amount == null ? "未公開" : fmt(x.amount)} | ${cell(h.terms.join("、"))} | ${x.url ? `[公告](${x.url})` : "-"} |\n`;
+          }
+        } else {
+          out += `| 機關 | 案號 | 標案名稱 | 預算金額 | 公告日 | 截止投標 | 命中的詞 | 連結 |\n| :--- | :--- | :--- | ---: | :--- | :--- | :--- | :--- |\n`;
+          for (const h of sorted.slice(0, preview)) {
+            const x = h.row;
+            out += `| ${cell(x.orgName)} | ${cell(x.caseId)} | ${cell(x.title)} | ${x.budget} | ${x.publishDate} | ${x.deadline} | ${cell(h.terms.join("、"))} | ${x.viewLink ? `[查看](${x.viewLink})` : "-"} |\n`;
+          }
+        }
+        if (sorted.length > preview) out += `\n> 另有 ${fmt(sorted.length - preview)} 筆未列出，見匯出檔。\n`;
+
+        try {
+          if (awardBase) {
+            const { csvPath, jsonPath } = await exportAwards(sorted.map(h => h.row), { tool: "expand_keywords", topic: args.topic, terms: stats.map(s => ({ ...s, origin: origin.get(s.term), uniqueOnly: uniqueOnly(s.term) })), matchedTerms: Object.fromEntries(sorted.map(h => [h.key, h.terms])) });
+            out += `\n**匯出（JSON 可直接給 rank_by_topic 的 exportFile）：**\n- CSV：${csvPath}\n- JSON：${jsonPath}\n`;
+          } else {
+            await mkdirAsync(RANK_EXPORT_DIR, { recursive: true });
+            const base = pathJoin(RANK_EXPORT_DIR, `expand_tenders_${Date.now()}`);
+            const esc = (v: unknown) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+            const head = ["機關", "案號", "標案名稱", "預算金額", "公告日", "截止投標", "命中的詞", "連結"];
+            const lines = sorted.map(h => [h.row.orgName, h.row.caseId, h.row.title, h.row.budget, h.row.publishDate, h.row.deadline, h.terms.join("、"), h.row.viewLink].map(esc).join(","));
+            await writeFileAsync(`${base}.csv`, String.fromCharCode(0xfeff) + [head.map(esc).join(","), ...lines].join("\r\n"), "utf8");
+            // rows 欄位名對齊 search_awards 匯出，讓 rank_by_topic 的 exportFile 也吃得下（日期放公告日）
+            const rows = sorted.map(h => ({ pk: extractPk(h.row.link) ?? "", url: h.row.link, orgName: h.row.orgName, caseNo: h.row.caseId, tenderName: h.row.title, amount: /^[\d,]+$/.test(String(h.row.budget)) ? Number(String(h.row.budget).replace(/,/g, "")) : null, awardNoticeDate: h.row.publishDate, deadline: h.row.deadline, matchedTerms: h.terms }));
+            await writeFileAsync(`${base}.json`, JSON.stringify({ tool: "expand_keywords", source: "tenders", topic: args.topic, terms: stats, exportedAt: new Date().toISOString(), rowCount: rows.length, rows }, null, 1), "utf8");
+            out += `\n**匯出（JSON 可直接給 rank_by_topic 的 exportFile）：**\n- CSV：${base}.csv\n- JSON：${base}.json\n`;
+          }
+        } catch (e: any) {
+          out += `\n**匯出失敗：${e.message}**\n`;
+        }
+      } else {
+        out += `\n（0 筆）\n`;
+      }
+
+      if (stopped) out += `\n> **查詢途中有代碼被官網擋下或失敗，後面的詞沒有查，結果不完整。請稍後再試，不要馬上重查。**\n`;
+      out += `\n> 詞表中「AI」的詞是模型產生的，每一列資料都來自官網清單查詢；詞太寬會混進不相關的案子，可用「只靠這個詞才找到」判斷，刪掉後用 terms 參數重查。要再篩相關性可把匯出 JSON 交給 rank_by_topic。\n`;
+      return reply(out);
+    } catch (error: any) {
+      return reply(`同義詞擴充查詢失敗: ${error.message}`);
     }
   }
 );
