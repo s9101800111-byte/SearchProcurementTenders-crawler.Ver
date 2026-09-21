@@ -86,3 +86,16 @@ export function calculateTenderPeriod(startDate: Date, endDate: Date): string {
   const days = Math.floor(diff / (1000 * 60 * 60 * 24));
   return `${days} 天`;
 }
+
+/**
+ * 民國 yyyMMdd 整數轉成官網查詢要的「西元」字串（1150701 → 2026/07/01）。
+ *
+ * ⚠️ 公開閱覽查詢（readTpRead）畫面上填的是民國，但送出前已被前端換成西元。
+ *    直接送民國年伺服器不報錯、直接回「共有 0 筆資料」，很容易誤判成真的沒案子。
+ */
+export function rocNumberToADSlash(n: number): string {
+  const y = Math.floor(n / 10000) + 1911;
+  const m = Math.floor((n % 10000) / 100);
+  const d = n % 100;
+  return `${y}/${String(m).padStart(2, '0')}/${String(d).padStart(2, '0')}`;
+}
