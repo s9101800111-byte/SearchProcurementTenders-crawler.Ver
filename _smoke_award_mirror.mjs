@@ -5,12 +5,22 @@ import { readFile, readdir, rm } from 'node:fs/promises';
 import { fetchAwardDetails } from './build/services/award-detail-crawler.js';
 import { rememberAwardDates } from './build/services/award-pk-index.js';
 
+
+// 匯出檔會被之後的查詢蓋過去，所以挑「含指定案號」的那一份，測試才不會隨機換資料集
+async function pickExport(marker) {
+  const files = (await readdir('.cache/exports')).filter(f => f.startsWith('awards_') && f.endsWith('.json')).sort().reverse();
+  for (const f of files) {
+    const rows = JSON.parse(await readFile(`.cache/exports/${f}`, 'utf8')).rows ?? [];
+    if (rows.some(r => r.caseNo === marker)) return { file: f, rows };
+  }
+  throw new Error(`.cache/exports 裡找不到含案號 ${marker} 的匯出檔；請先跑 search_awards`);
+}
+
 const CACHE = process.env.TEMP + '/_smoke_award_mirror_cache.json';
 await rm(CACHE, { force: true });
 
-const files = (await readdir('.cache/exports')).filter(f => f.startsWith('awards_') && f.endsWith('.json')).sort();
-const rows = JSON.parse(await readFile(`.cache/exports/${files.at(-1)}`, 'utf8')).rows;
-console.log(`官方清單 ${rows.length} 件（${files.at(-1)}）`);
+const { file, rows } = await pickExport('CU-11506');
+console.log(`官方清單 ${rows.length} 件（${file}）`);
 
 // 模擬 search_awards 跑過：把 pk → 決標公告日 記進索引
 rememberAwardDates(rows);

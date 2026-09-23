@@ -6,6 +6,17 @@ import { readFile, readdir } from 'node:fs/promises';
 
 const DATE = 1150922;
 
+// 匯出檔會被之後的查詢蓋過去，所以挑「含指定案號」的那一份，測試才不會隨機換資料集
+async function pickExport(marker) {
+  const files = (await readdir('.cache/exports')).filter(f => f.startsWith('awards_') && f.endsWith('.json')).sort().reverse();
+  for (const f of files) {
+    const rows = JSON.parse(await readFile(`.cache/exports/${f}`, 'utf8')).rows ?? [];
+    if (rows.some(r => r.caseNo === marker)) return { file: f, rows };
+  }
+  throw new Error(`.cache/exports 裡找不到含案號 ${marker} 的匯出檔；請先跑 search_awards`);
+}
+
+
 console.log('=== 1. fetchDayIndex ===');
 const day = await fetchDayIndex(DATE);
 console.log(`公告 ${day.records} 筆｜有得標廠商 ${day.index.size} 筆｜請求 ${day.requests} 次${day.error ? `｜錯誤 ${day.error}` : ''}`);
@@ -18,9 +29,8 @@ if (sample?.winners?.[0] !== '煌利營造工程有限公司') { console.error('
 if (sample.losers[0] !== '展佑土木包工業' || sample.bidderCount !== 2) { console.error('未得標廠商／投標家數解析不對'); process.exit(1); }
 
 console.log('\n=== 2. 端到端：建工作 → 跑第 0 步 ===');
-const files = (await readdir('.cache/exports')).filter(f => f.startsWith('awards_') && f.endsWith('.json')).sort();
-const rows = JSON.parse(await readFile(`.cache/exports/${files.at(-1)}`, 'utf8')).rows;
-console.log(`官方清單 ${rows.length} 件（${files.at(-1)}）`);
+const { file, rows } = await pickExport('CU-11506');
+console.log(`官方清單 ${rows.length} 件（${file}）`);
 
 const job = await createJob({
   label: '_smoke_mirror',

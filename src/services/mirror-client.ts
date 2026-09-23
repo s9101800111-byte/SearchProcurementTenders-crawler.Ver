@@ -231,6 +231,30 @@ function money(v: unknown): number | null {
 const text = (v: unknown) => String(v ?? '').trim();
 
 /**
+ * 同一個欄位在不同版型的決標公告掛在不同區段底下：
+ *   公開招標 → 「已公告資料:預算金額」
+ *   限制性招標(未經公開評選或公開徵求) → 「採購資料:預算金額」
+ * 只認一種會把限制性招標的預算金額、決標方式、標案名稱、案號全部誤判成「沒有」。
+ * 所以先試已知區段，再退回掃「任一區段:欄位名」，避免日後又冒出第三種版型。
+ */
+const AWARD_SECTIONS = ['已公告資料', '採購資料'];
+function field(d: Record<string, any>, name: string): string {
+  for (const sec of AWARD_SECTIONS) {
+    const v = text(d[`${sec}:${name}`]);
+    if (v) return v;
+  }
+  const suffix = `:${name}`;
+  for (const [k, v] of Object.entries(d)) {
+    // 只收單層區段，別誤抓「投標廠商:投標廠商1:決標金額」這種第二層的
+    if (k.endsWith(suffix) && k.indexOf(':') === k.length - suffix.length) {
+      const t = text(v);
+      if (t) return t;
+    }
+  }
+  return '';
+}
+
+/**
  * 鏡像 /api/tender 的 detail 是「前綴:欄位」的扁平物件，例如
  *   投標廠商:投標廠商2:廠商名稱、決標資料:總決標金額。
  * 這裡把它組回與官方內頁解析同一個 AwardDetailRecord 形狀，下游才不用分兩套。
@@ -260,25 +284,25 @@ function buildAwardRecord(d: Record<string, any>): AwardDetailRecord | null {
   const bidderCount = /^\d+$/.test(countRaw) ? parseInt(countRaw, 10) : null;
   if (bidderCount == null || winners.length === 0) return null;
 
-  const budget = money(d['已公告資料:預算金額']);
+  const budget = money(field(d, '預算金額'));
   const totalAward = money(d['決標資料:總決標金額']);
   return {
     pageType: 'award',
     orgName: text(d['機關資料:機關名稱']),
-    caseNo: text(d['已公告資料:標案案號']),
-    tenderName: text(d['已公告資料:標案名稱']),
-    category: text(d['已公告資料:標的分類']),
-    tenderWay: text(d['已公告資料:招標方式']),
-    awardWay: text(d['已公告資料:決標方式']),
+    caseNo: field(d, '標案案號'),
+    tenderName: field(d, '標案名稱'),
+    category: field(d, '標的分類'),
+    tenderWay: field(d, '招標方式'),
+    awardWay: field(d, '決標方式'),
     budget,
     floorPrice: money(d['決標資料:底價金額']),
     totalAward,
     awardDate: text(d['決標資料:決標日期']),
     awardNoticeDate: text(d['決標資料:決標公告日期']),
-    execArea: text(d['已公告資料:履約地點（含地區）']) || text(d['已公告資料:履約地點']),
+    execArea: field(d, '履約地點（含地區）') || field(d, '履約地點'),
     period: winners[0]?.period ?? '',
     bidderCount,
-    jointBid: text(d['已公告資料:是否共同投標']),
+    jointBid: field(d, '是否共同投標'),
     bidders,
     winners,
     losers: bidders.filter(b => b.won !== '是'),
