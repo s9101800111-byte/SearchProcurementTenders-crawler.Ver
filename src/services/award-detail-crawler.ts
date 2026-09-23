@@ -845,3 +845,85 @@ export function renderAwardDetails(batch: AwardDetailBatch, opts: { full?: boole
   }
   return out;
 }
+
+// ---------- 人工存檔的 HTML ----------
+
+/**
+ * 取得決標公告的第三條路：人工另存的網頁。
+ *
+ * 為什麼需要：鏡像沒收錄、官方內頁又被驗證碼鎖住時，這是唯一出路。
+ * 2026-09-23 實測 53 筆鏡像查無的案子，由使用者逐一開啟官方內頁另存 HTML，
+ * 用同一支 parseAwardDetailHtml 解析，53/53 全數成功且欄位與官方一致。
+ *
+ * 解析結果寫進與線上抓取同一份快取，之後 get_award_detail 查同一案就直接命中，
+ * 不必再開網頁、也不佔額度。
+ */
+export interface ParsedHtmlFile {
+  file: string;
+  ok: boolean;
+  pk?: string;
+  kind?: AwardDetailKind;
+  record?: AwardDetailRecord | NonAwardDetailRecord;
+  cached?: boolean;
+  message?: string;
+}
+
+/** 存檔頁面裡帶著原始網址，pk 從那裡取；抓不到就沒辦法入快取 */
+function pkFromHtml(html: string): { pk: string; kind: AwardDetailKind } | null {
+  const m = html.match(/QueryAtm(Non)?AwardDetail\?pkAtmMain=([A-Za-z0-9%+/=]+)/);
+  if (m) return { pk: safeDecode(m[2]), kind: m[1] ? 'nonAward' : 'award' };
+  const m2 = html.match(/[?&]pkAtmMain=([A-Za-z0-9%+/=]+)/);
+  if (m2) return { pk: safeDecode(m2[1]), kind: 'award' };
+  return null;
+}
+
+/**
+ * 解析一批本機 HTML 檔並寫入快取。
+ * files 已經是展開後的檔案路徑清單（呼叫端負責處理資料夾）。
+ */
+export async function ingestAwardHtmlFiles(
+  files: { path: string; html: string }[],
+  opts: { cacheFile?: string } = {},
+): Promise<{ results: ParsedHtmlFile[]; added: number; updated: number }> {
+  const file = opts.cacheFile ?? AWARD_DETAIL_CACHE_FILE;
+  const store = await loadCache(file);
+  const results: ParsedHtmlFile[] = [];
+  let added = 0, updated = 0;
+
+  for (const f of files) {
+    const found = pkFromHtml(f.html);
+    const page = parseAwardDetailHtml(f.html, found?.kind ?? null);
+
+    if (page.type === 'blocked') {
+      results.push({ file: f.path, ok: false, message: `這頁是驗證碼／封鎖頁，不是公告內容（${page.message}）——請重新開啟並通過驗證後再存` });
+      continue;
+    }
+    if (page.type === 'parse') {
+      results.push({ file: f.path, ok: false, message: `解析不出公告內容：${page.message}` });
+      continue;
+    }
+    if (!found) {
+      results.push({ file: f.path, ok: false, kind: page.type, record: page.record, message: '頁面裡找不到 pkAtmMain，無法對應案件編號，未寫入快取（請用「網頁，僅 HTML」另存原始頁面，不要用列印或轉存 PDF 再轉回來）' });
+      continue;
+    }
+
+    // 與線上抓取同一套把關：解析不可信的不入快取
+    const reject = rejectReason(page, found.kind, false);
+    if (reject) {
+      results.push({ file: f.path, ok: false, pk: found.pk, kind: page.type, message: reject });
+      continue;
+    }
+
+    const key = `${found.kind}:${found.pk}`;
+    const existed = Boolean(validEntry(store[key]));
+    store[key] = {
+      kind: found.kind, pk: found.pk, url: awardDetailUrl(found.kind, found.pk),
+      record: page.record, pairs: page.pairs, savedAt: new Date().toISOString(),
+    };
+    existed ? updated++ : added++;
+    results.push({ file: f.path, ok: true, pk: found.pk, kind: page.type, record: page.record, cached: existed });
+  }
+
+  if (added || updated) await saveCache(file, store);
+  return { results, added, updated };
+}

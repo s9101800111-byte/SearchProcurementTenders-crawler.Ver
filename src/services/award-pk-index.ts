@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir, rename, unlink } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rename, unlink, stat } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { AwardRow } from '../types/award.js';
@@ -22,18 +22,35 @@ const MAX_ENTRIES = 50_000;
 const FLUSH_DELAY_MS = 2000;
 
 let index: Map<string, number> | null = null;
+/** 上次讀檔時的 mtime；別的行程寫新內容進來要能發現 */
+let loadedMtimeMs = 0;
 let dirty = false;
 let flushTimer: NodeJS.Timeout | null = null;
 let tmpSeq = 0;
 
+/**
+ * Claude Desktop 與 Claude Code 會各開一個 MCP 行程，共用這一份索引檔。
+ * 只在記憶體快取會讓「A 行程剛查過的清單、B 行程查內頁時卻讀不到日期」，
+ * 於是靜默退回官方內頁去撞額度——這正是這份索引要避免的事。
+ * 所以每次讀取都看一下檔案 mtime，變了就把磁碟內容併進來（本行程未寫檔的部分以磁碟為準）。
+ */
 async function load(file: string): Promise<Map<string, number>> {
-  if (index) return index;
+  let mtimeMs = 0;
+  try { mtimeMs = (await stat(file)).mtimeMs; } catch { /* 還沒有檔案 */ }
+
+  if (index && mtimeMs === loadedMtimeMs) return index;
+
+  let disk: Map<string, number>;
   try {
     const parsed = JSON.parse(await readFile(file, 'utf8')) as Record<string, number>;
-    index = new Map(Object.entries(parsed).filter(([, v]) => typeof v === 'number'));
+    disk = new Map(Object.entries(parsed).filter(([, v]) => typeof v === 'number'));
   } catch {
-    index = new Map();
+    disk = new Map();
   }
+  // 合併而非覆蓋：本行程剛記下、還沒 flush 的項目不能被磁碟版本洗掉
+  if (index) for (const [k, v] of index) if (!disk.has(k)) disk.set(k, v);
+  index = disk;
+  loadedMtimeMs = mtimeMs;
   return index;
 }
 
@@ -50,6 +67,7 @@ async function flush(file: string): Promise<void> {
     await mkdir(dirname(file), { recursive: true });
     await writeFile(tmp, JSON.stringify(Object.fromEntries(index)), 'utf8');
     await rename(tmp, file);
+    try { loadedMtimeMs = (await stat(file)).mtimeMs; } catch { /* 取不到就下次重讀，無害 */ }
   } catch (e: any) {
     await unlink(tmp).catch(() => undefined);
     console.error(`[AwardPkIndex] 寫入失敗（不影響查詢結果）: ${e.message}`);

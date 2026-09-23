@@ -14,8 +14,10 @@ import { resolveCounties, listCounties, OTHER_LOCATION_CODE } from "./services/a
 import { ExecLocationOption } from "./types/award.js";
 import {
   fetchAwardDetails, renderAwardDetails, MAX_AWARD_FETCH_PER_CALL, MAX_AWARD_CASES,
-  DETAIL_WINDOW_MAX, DETAIL_WINDOW_MS, FULL_FIELDS_MAX_CASES,
+  DETAIL_WINDOW_MAX, DETAIL_WINDOW_MS, FULL_FIELDS_MAX_CASES, ingestAwardHtmlFiles,
 } from "./services/award-detail-crawler.js";
+import { readFile, readdir, stat } from "node:fs/promises";
+import { join as joinPath, basename } from "node:path";
 import {
   createJob, loadJob, listJobs, runJob, setJobState, jobSummary, seedVendorsFromCache, setJobPriority, JobPriority,
 } from "./services/resolve-service.js";
@@ -1276,6 +1278,88 @@ server.tool(
       return reply(out);
     } catch (error: any) {
       return reply(`同義詞擴充查詢失敗: ${error.message}`);
+    }
+  }
+);
+
+server.tool(
+  "parse_award_html",
+  `Parse award-notice pages (決標公告內頁) that were saved to disk BY HAND and load them into this server's detail cache. This is the THIRD and last route to award details, for cases the other two cannot reach: the g0v mirror does not have the announcement (roughly 9% of cases, measured) AND the official detail page is CAPTCHA-locked. Workflow: get_award_detail reports which cases it could not retrieve and gives their links -> the user opens each link in a browser, passes the CAPTCHA, and saves with Ctrl+S as "Webpage, HTML Only" -> this tool reads those files. Filenames do NOT matter: the case is identified by the pkAtmMain in the page itself, and the fields come from the SAME parser used for live fetches, so the result is identical to a live get_award_detail (得標廠商+統編, 投標廠商家數, 落標廠商, 預算金額, 底價, 總決標金額, 減標率, 決標方式/日期, 履約地點/起迄, bidder table). Parsed cases are written to the shared cache, so afterwards get_award_detail on those same cases returns instantly, for free, and without touching the official site. Verified 2026-09-23 on 53 hand-saved pages: 53/53 parsed, all matched their case, fields agreed with the official listing. NOTES: (1) pages saved as PDF, or "Webpage, Complete" where the .html was later edited, may lose the pkAtmMain link — those are reported as not-cached rather than guessed; (2) a page saved BEFORE passing the CAPTCHA is detected and rejected, not stored as if it were data; (3) the same parse guards as live fetching apply (a 決標公告 missing 投標廠商家數 or 得標廠商 is refused), so a bad save never silently poisons the cache.`,
+  {
+    paths: z.array(z.string()).min(1).max(500).describe("HTML 檔案路徑，或含 HTML 的資料夾路徑（資料夾會自動展開，不遞迴）；1~500 個"),
+  },
+  async ({ paths }) => {
+    const reply = (text: string) => ({ content: [{ type: "text" as const, text }] });
+    try {
+      // 展開資料夾
+      const files: string[] = [];
+      for (const p of paths) {
+        let st;
+        try { st = await stat(p); } catch { return reply(`找不到路徑：${p}`); }
+        if (st.isDirectory()) {
+          const inner = (await readdir(p)).filter(f => /\.html?$/i.test(f)).sort((a, b) => (parseInt(a) || 0) - (parseInt(b) || 0) || a.localeCompare(b));
+          for (const f of inner) files.push(joinPath(p, f));
+        } else files.push(p);
+      }
+      if (files.length === 0) return reply(`給的路徑裡沒有 .html 檔。`);
+      if (files.length > 500) return reply(`一次最多 500 個檔，本次展開後有 ${files.length} 個，請分批。`);
+
+      const loaded: { path: string; html: string }[] = [];
+      const unreadable: string[] = [];
+      for (const f of files) {
+        try { loaded.push({ path: f, html: (await readFile(f)).toString("utf8") }); }
+        catch (e: any) { unreadable.push(`${f}（${e.code || e.message}）`); }
+      }
+
+      const { results, added, updated } = await ingestAwardHtmlFiles(loaded);
+      const okRows = results.filter(r => r.ok);
+      const bad = results.filter(r => !r.ok);
+
+      const base = (p: string) => basename(p);
+      const cell = (v: unknown) => String(v ?? "").replace(/\|/g, "\\|");
+      let out = `### 人工存檔解析（${files.length} 檔）
+
+`;
+      out += `- 解析成功 ${okRows.length} 檔｜新增快取 ${added} 案、更新 ${updated} 案｜失敗 ${bad.length} 檔${unreadable.length ? `｜讀不到 ${unreadable.length} 檔` : ""}
+
+`;
+
+      if (okRows.length) {
+        out += `| 檔案 | 機關 | 案號 | 得標廠商 | 投標家數 | 決標金額 |
+| :--- | :--- | :--- | :--- | ---: | ---: |
+`;
+        for (const r of okRows.slice(0, 60)) {
+          const rec: any = r.record;
+          const winners = rec.pageType === "award" ? rec.winners.map((w: any) => w.name).join(" / ") : "（無法決標）";
+          const n = rec.pageType === "award" ? rec.bidderCount ?? "-" : "-";
+          const amt = rec.pageType === "award" && rec.totalAward != null ? rec.totalAward.toLocaleString("en-US") : "-";
+          out += `| ${cell(base(r.file))} | ${cell(rec.orgName)} | ${cell(rec.caseNo)} | ${cell(winners)} | ${n} | ${amt} |
+`;
+        }
+        if (okRows.length > 60) out += `
+> 表格只列前 60 檔。
+`;
+      }
+      if (bad.length) {
+        out += `
+**未入快取 ${bad.length} 檔：**
+`;
+        for (const r of bad) out += `- ${cell(base(r.file))} — ${cell(r.message)}
+`;
+      }
+      if (unreadable.length) {
+        out += `
+**讀不到的檔：**
+`;
+        for (const u of unreadable) out += `- ${cell(u)}
+`;
+      }
+      if (added || updated) out += `
+> 這些案子已進快取：現在對同一批連結／pk 呼叫 get_award_detail 會直接回快取，不連線、不佔額度。
+`;
+      return reply(out);
+    } catch (error: any) {
+      return reply(`解析人工存檔失敗: ${error.message}`);
     }
   }
 );
