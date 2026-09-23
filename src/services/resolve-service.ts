@@ -57,6 +57,17 @@ export interface ResolveCase {
   totalAward?: number | null;
   source?: ResolveSource;
   message?: string;
+  /** 以下是 fullDetail 才會填：決標公告內頁有、清單頁與鏡像日索引都沒有的欄位 */
+  category?: string;
+  tenderWay?: string;
+  awardWay?: string;
+  floorPrice?: number | null;
+  discountRate?: number | null;
+  awardDate?: string;
+  execArea?: string;
+  period?: string;
+  /** 已補過完整欄位，續跑時不重抓 */
+  detailed?: boolean;
 }
 
 export interface ResolveJob {
@@ -73,7 +84,9 @@ export interface ResolveJob {
   vendorQueue: string[];
   /** 已反查過的，不重複查 */
   triedVendors: string[];
-  stats: { total: number; resolved: number; failed: number; lookups: number; detailFetches: number; solvedByLookup: number; solvedByDetail: number; solvedByDirectory?: number; solvedByMirror?: number };
+  stats: { total: number; resolved: number; failed: number; lookups: number; detailFetches: number; solvedByLookup: number; solvedByDetail: number; solvedByDirectory?: number; solvedByMirror?: number; detailed?: number; detailFailed?: number };
+  /** 補完廠商後，再逐案把決標公告的其餘欄位抓齊（標的分類、底價、決標日、履約地點…） */
+  fullDetail?: boolean;
   /** 鏡像掃日；舊版工作檔沒有這欄，視同未啟用 */
   mirror?: {
     enabled: boolean;
@@ -183,6 +196,8 @@ export interface CreateJobInput {
   counties?: string[];
   /** 先用 g0v 鏡像掃日補廠商，預設開啟（鏡像限非商業用途） */
   mirror?: boolean;
+  /** 廠商補完後再逐案補齊決標公告的其餘欄位，預設關閉（一案一請求，慢很多） */
+  fullDetail?: boolean;
 }
 
 export async function createJob(input: CreateJobInput): Promise<ResolveJob> {
@@ -211,8 +226,9 @@ export async function createJob(input: CreateJobInput): Promise<ResolveJob> {
     cases,
     vendorQueue: [...new Set(input.seedVendors ?? [])],
     triedVendors: [],
-    stats: { total: cases.length, resolved: 0, failed: 0, lookups: 0, detailFetches: 0, solvedByLookup: 0, solvedByDetail: 0, solvedByDirectory: 0, solvedByMirror: 0 },
+    stats: { total: cases.length, resolved: 0, failed: 0, lookups: 0, detailFetches: 0, solvedByLookup: 0, solvedByDetail: 0, solvedByDirectory: 0, solvedByMirror: 0, detailed: 0, detailFailed: 0 },
     mirror: { enabled: input.mirror ?? true, done: [], requests: 0 },
+    fullDetail: Boolean(input.fullDetail),
     directory: {
       mode: input.directory ?? 'off',
       counties: input.counties?.length ? input.counties : inferCounties(cases),
@@ -379,6 +395,39 @@ async function mirrorScanDay(job: ResolveJob, date: number): Promise<{ hit: numb
   return { hit };
 }
 
+/**
+ * fullDetail：逐案把決標公告其餘欄位補齊（標的分類、底價、減標率、決標日、履約地點與起迄）。
+ * 只走鏡像（mirrorOnly），鏡像沒有的就標記跳過——不拿官方那 5 次/10 分鐘的額度來換這些欄位，
+ * 那個額度要留給真的只能開官方內頁的案子。
+ */
+async function fillOneDetail(job: ResolveJob, c: ResolveCase): Promise<'ok' | 'miss'> {
+  const batch = await fetchAwardDetails([c.url || c.pk], { mirrorOnly: true });
+  // 這步也在打鏡像，要計進同一份連線統計，否則摘要會低報實際成本
+  if (job.mirror) job.mirror.requests += batch.mirrorRequests;
+  const r = batch.results[0];
+  if (!r?.ok || !r.record || r.record.pageType !== 'award') {
+    c.detailed = true; // 標記處理過，免得續跑時卡在同一筆
+    job.stats.detailFailed = (job.stats.detailFailed ?? 0) + 1;
+    return 'miss';
+  }
+  const rec = r.record;
+  c.category = rec.category;
+  c.tenderWay = rec.tenderWay;
+  c.awardWay = rec.awardWay;
+  c.floorPrice = rec.floorPrice;
+  c.discountRate = rec.discountRate;
+  c.awardDate = rec.awardDate;
+  c.execArea = rec.execArea;
+  c.period = rec.period;
+  // 這些欄位鏡像日索引給不了，逐案抓才有；既有值不覆寫
+  if (c.budget == null) c.budget = rec.budget;
+  if (c.totalAward == null) c.totalAward = rec.totalAward;
+  if (c.bidderCount == null) c.bidderCount = rec.bidderCount;
+  c.detailed = true;
+  job.stats.detailed = (job.stats.detailed ?? 0) + 1;
+  return 'ok';
+}
+
 /** 背景工作：反查與內頁交替，直到全解完或被叫停 */
 export async function runJob(id: string, opts: { maxMinutes?: number } = {}): Promise<void> {
   const deadline = Date.now() + (opts.maxMinutes ?? 720) * 60_000;
@@ -471,13 +520,27 @@ export async function runJob(id: string, opts: { maxMinutes?: number } = {}): Pr
       }
     }
 
+    // 2.5 補齊欄位：等廠商都處理完再做，免得跟反查搶時間
+    if (job.fullDetail && job.cases.every(c => c.status !== 'unknown')) {
+      const next = job.cases.find(c => c.status === 'resolved' && !c.detailed);
+      if (next) {
+        const r = await fillOneDetail(job, next);
+        const left = job.cases.filter(c => c.status === 'resolved' && !c.detailed).length;
+        job.message = `補欄位 ${next.caseNo}：${r === 'ok' ? next.category || '已補' : '鏡像沒有，略過'}｜已補 ${job.stats.detailed ?? 0}／略過 ${job.stats.detailFailed ?? 0}／剩 ${left}`;
+        await saveJob(job);
+        continue;
+      }
+    }
+
     // 3. 反查做完了，剩下的走內頁：有排名就 A→B→C（組內分數高、金額大的先），沒有就金額大的先
     const { pending, skipped } = detailQueue(job);
-    if (pending.length === 0) {
+    const detailLeft = job.fullDetail ? job.cases.filter(c => c.status === 'resolved' && !c.detailed).length : 0;
+    if (pending.length === 0 && detailLeft === 0) {
       recount(job);
       job.state = 'done';
       job.message = `完成：已解 ${job.stats.resolved}/${job.stats.total}${job.stats.failed ? `，失敗 ${job.stats.failed}` : ''}`
-        + (skipped ? `｜C 組 ${skipped} 件依 skipGroupC 設定未開內頁（仍未解）` : '');
+        + (skipped ? `｜C 組 ${skipped} 件依 skipGroupC 設定未開內頁（仍未解）` : '')
+        + (job.fullDetail ? `｜欄位已補 ${job.stats.detailed ?? 0} 件${job.stats.detailFailed ? `、鏡像沒有 ${job.stats.detailFailed} 件` : ''}` : '');
       await saveJob(job);
       return;
     }
@@ -557,6 +620,7 @@ export function jobSummary(job: ResolveJob): string {
       for (const c of unknown) { const r = job.priority!.ranks[c.pk]; if (r) g[r.group]++; else g.none++; }
       return `- 內頁順序：依排名 \`${job.priority.rankId}\`（${job.priority.topic}）A→B→C｜待解 A ${fmt(g.A)}／B ${fmt(g.B)}／C ${fmt(g.C)}${g.none ? `／不在排名 ${fmt(g.none)}（排在 B 之後）` : ''}${job.priority.skipGroupC ? '｜C 組不開內頁' : ''}`;
     })()] : []),
+    ...(job.fullDetail ? [`- 補欄位：已補 ${fmt(s.detailed ?? 0)} 件（標的分類／底價／減標率／決標日／履約地點）｜鏡像沒有 ${fmt(s.detailFailed ?? 0)} 件｜待補 ${fmt(job.cases.filter(c => c.status === 'resolved' && !c.detailed).length)} 件`] : []),
     `- 更新時間 ${job.updatedAt}`,
   ].join('\n');
 }

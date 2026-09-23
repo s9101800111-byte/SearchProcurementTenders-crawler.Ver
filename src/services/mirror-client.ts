@@ -133,8 +133,33 @@ export interface DayIndexResult {
   error?: string;
 }
 
+/**
+ * 日索引短期快取。
+ * 逐案補欄位時，每個案子都要先有當天的日索引才能定位，沒有快取的話同一天會被重抓 N 次
+ * （實測 3 個案子打了 7 次請求而不是 4 次），564 件就會多花半小時，也是白打人家的伺服器。
+ * 過去日期的公告不會再變，短期快取很安全；只留幾天份，免得整包 JSON 佔記憶體。
+ */
+const DAY_CACHE_TTL_MS = 10 * 60_000;
+const DAY_CACHE_MAX = 5;
+const dayCache = new Map<number, { at: number; result: DayIndexResult }>();
+
 /** 抓某一天（民國 yyyMMdd）的全部公告，建成 機關＋案號 → 得標資訊 的索引 */
 export async function fetchDayIndex(rocDate: number): Promise<DayIndexResult> {
+  const hit = dayCache.get(rocDate);
+  if (hit && Date.now() - hit.at < DAY_CACHE_TTL_MS) {
+    // 回報 requests: 0，呼叫端的連線統計才不會把快取命中算成真的請求
+    return { ...hit.result, requests: 0 };
+  }
+  const fresh = await fetchDayIndexUncached(rocDate);
+  // 失敗的不要快取，下次要能重試
+  if (!fresh.error) {
+    dayCache.set(rocDate, { at: Date.now(), result: fresh });
+    while (dayCache.size > DAY_CACHE_MAX) dayCache.delete(dayCache.keys().next().value as number);
+  }
+  return fresh;
+}
+
+async function fetchDayIndexUncached(rocDate: number): Promise<DayIndexResult> {
   const url = `${BASE}/listbydate?date=${rocToAd(rocDate)}`;
   let requests = 0;
   let lastError = '';

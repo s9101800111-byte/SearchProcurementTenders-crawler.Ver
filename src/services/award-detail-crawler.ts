@@ -607,7 +607,10 @@ async function tryMirror(
   return { record: detail.record, pairs: detail.pairs, requests };
 }
 
-export async function fetchAwardDetails(inputs: string[], opts: { cacheFile?: string; mirror?: boolean } = {}): Promise<AwardDetailBatch> {
+export async function fetchAwardDetails(
+  inputs: string[],
+  opts: { cacheFile?: string; mirror?: boolean; mirrorOnly?: boolean } = {},
+): Promise<AwardDetailBatch> {
   if (inputs.length > MAX_AWARD_CASES) {
     throw new Error(`一次最多 ${MAX_AWARD_CASES} 筆，本次給了 ${inputs.length} 筆，請分批`);
   }
@@ -628,6 +631,8 @@ export async function fetchAwardDetails(inputs: string[], opts: { cacheFile?: st
   // 同一批常常是同一天的案子，日索引抓一次就好
   const dayCache = new Map<number, DayIndexResult>();
   const useMirror = opts.mirror ?? true;
+  // 批次補欄位的情境：鏡像拿不到就算了，不要回頭去燒官方那 5 次/10 分鐘的額度
+  const mirrorOnly = Boolean(opts.mirrorOnly);
 
   for (const input of inputs) {
     const n = normalizeAwardInput(input);
@@ -666,6 +671,11 @@ export async function fetchAwardDetails(inputs: string[], opts: { cacheFile?: st
         results.push({ ...base, ok: true, cached: false, fromMirror: true, record: m.record, pairs: m.pairs });
         continue;
       }
+    }
+
+    if (mirrorOnly) {
+      results.push({ ...base, ok: false, cached: false, failure: 'error', message: '鏡像沒有這筆，mirrorOnly 模式不開官方內頁' });
+      continue;
     }
 
     let r: AwardDetailResult;

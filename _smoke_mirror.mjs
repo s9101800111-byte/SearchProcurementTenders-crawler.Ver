@@ -59,7 +59,12 @@ for (const c of after.cases.filter(c => c.source === '鏡像').slice(0, 3)) {
 }
 
 if (pct < 85) { console.error(`\nFAIL：鏡像命中率 ${pct}% 低於預期的 85%`); process.exit(1); }
-if (after.mirror.requests < after.mirror.done.length) { console.error(`\nFAIL：掃了 ${after.mirror.done.length} 天卻只打 ${after.mirror.requests} 次`); process.exit(1); }
+if (after.mirror.requests < 1) { console.error(`\nFAIL：一次鏡像請求都沒打`); process.exit(1); }
+// 日索引有 10 分鐘快取，同一天被重掃時 requests 會是 0，所以只能斷言「不超過天數」而非「至少天數」
+if (after.mirror.requests > after.mirror.done.length) { console.error(`\nFAIL：掃 ${after.mirror.done.length} 天卻打了 ${after.mirror.requests} 次，日索引快取沒生效`); process.exit(1); }
 if (after.vendorQueue.length > after.stats.total) { console.error(`\nFAIL：反查佇列 ${after.vendorQueue.length} 家超過案件數 ${after.stats.total}，鏡像把整天的廠商都塞進來了`); process.exit(1); }
-if (after.stats.lookups !== 0) { console.error(`\nFAIL：第 0 步不該打官方清單端點，實際 ${after.stats.lookups} 次`); process.exit(1); }
+// 內頁額度是真正稀缺的資源，這個一定要是 0；清單端點沒有驗證碼限制，
+// 而且日索引快取讓掃日變快後，測試視窗內可能已經接著跑進反查，所以只放寬到「沒失控」
+if (after.stats.detailFetches !== 0) { console.error(`\nFAIL：不該開官方內頁，實際 ${after.stats.detailFetches} 次`); process.exit(1); }
+if (after.stats.lookups > 3) { console.error(`\nFAIL：清單端點打了 ${after.stats.lookups} 次，超出預期`); process.exit(1); }
 console.log('\nPASS');
