@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { AwardBidder, AwardDetailKind, AwardDetailRecord, NonAwardDetailRecord } from '../types/award.js';
 
 /**
  * g0v 政府採購網鏡像（ronnywang/pcc.g0v.ronny.tw）唯讀用戶端。
@@ -110,9 +111,20 @@ function parseCompanies(brief: any): MirrorAward | null {
   };
 }
 
+export interface MirrorCaseRef {
+  unitId: string;
+  jobNumber: string;
+  unitName: string;
+  /** 公告檔名，例 BDM-1-71287821 */
+  filename: string;
+  type: string;
+}
+
 export interface DayIndexResult {
   /** 機關＋案號 → 得標資訊；當天沒公告時是空的 */
   index: Map<string, MirrorAward>;
+  /** 收文編號（官方 pk base64 解開就是這串數字）→ 案件位址，用來從 pk 直接定位鏡像案件 */
+  byFiling: Map<string, MirrorCaseRef>;
   /** 當天公告總筆數（含招標公告等非決標類） */
   records: number;
   /** 實際送出的 HTTP 請求數（含退避重試） */
@@ -168,15 +180,200 @@ export async function fetchDayIndex(rocDate: number): Promise<DayIndexResult> {
 
     const records: any[] = Array.isArray(parsed?.records) ? parsed.records : [];
     const index = new Map<string, MirrorAward>();
+    const byFiling = new Map<string, MirrorCaseRef>();
     for (const r of records) {
+      const filename = String(r?.filename ?? '');
+      const filing = filingNumberOf(filename);
+      if (filing) {
+        byFiling.set(filing, {
+          unitId: String(r?.unit_id ?? ''),
+          jobNumber: String(r?.job_number ?? ''),
+          unitName: String(r?.unit_name ?? ''),
+          filename,
+          type: String(r?.brief?.type ?? ''),
+        });
+      }
       const award = parseCompanies(r?.brief);
       if (!award) continue;
       const key = mirrorCaseKey(r?.unit_name ?? '', r?.job_number ?? '');
       // 同一天同案號有多筆（決標＋更正決標）時保留先出現的，更正的資訊不一定更完整
       if (!index.has(key)) index.set(key, award);
     }
-    return { index, records: records.length, requests };
+    return { index, byFiling, records: records.length, requests };
   }
 
-  return { index: new Map(), records: 0, requests, error: lastError || '未知錯誤' };
+  return { index: new Map(), byFiling: new Map(), records: 0, requests, error: lastError || '未知錯誤' };
+}
+
+// ---------- 從 pk 直接取單案完整明細 ----------
+
+/** 公告檔名 BDM-1-71287821 → 收文編號 71287821；官方 pk 就是這串數字的 base64 */
+export function filingNumberOf(filename: string): string | null {
+  const m = String(filename || '').match(/(\d+)$/);
+  return m ? m[1] : null;
+}
+
+/** 官方 pk（base64）→ 收文編號；不是純數字就回 null（那不是這套編號） */
+export function filingNumberFromPk(pk: string): string | null {
+  try {
+    const s = Buffer.from(pk, 'base64').toString('utf8');
+    return /^\d+$/.test(s) ? s : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 「3,436,364元」→ 3436364；未公開／空白回 null */
+function money(v: unknown): number | null {
+  const m = String(v ?? '').replace(/,/g, '').match(/(\d+)\s*元/);
+  return m ? parseInt(m[1], 10) : null;
+}
+const text = (v: unknown) => String(v ?? '').trim();
+
+/**
+ * 鏡像 /api/tender 的 detail 是「前綴:欄位」的扁平物件，例如
+ *   投標廠商:投標廠商2:廠商名稱、決標資料:總決標金額。
+ * 這裡把它組回與官方內頁解析同一個 AwardDetailRecord 形狀，下游才不用分兩套。
+ */
+function buildAwardRecord(d: Record<string, any>): AwardDetailRecord | null {
+  const bidders: AwardBidder[] = [];
+  for (let i = 1; ; i++) {
+    const name = text(d[`投標廠商:投標廠商${i}:廠商名稱`]);
+    if (!name) break;
+    bidders.push({
+      no: i,
+      vendorId: text(d[`投標廠商:投標廠商${i}:廠商代碼`]),
+      name,
+      won: text(d[`投標廠商:投標廠商${i}:是否得標`]),
+      orgType: text(d[`投標廠商:投標廠商${i}:組織型態`]),
+      trade: text(d[`投標廠商:投標廠商${i}:廠商業別`]),
+      address: text(d[`投標廠商:投標廠商${i}:廠商地址`]),
+      phone: text(d[`投標廠商:投標廠商${i}:廠商電話`]),
+      sme: text(d[`投標廠商:投標廠商${i}:是否為中小企業`]),
+      amount: money(d[`投標廠商:投標廠商${i}:決標金額`]),
+      period: text(d[`投標廠商:投標廠商${i}:履約起迄日期`]),
+    });
+  }
+  const winners = bidders.filter(b => b.won === '是');
+  // 與官方內頁同一套把關：家數與得標廠商缺一就不採用，寧可回頭走官方頁
+  const countRaw = text(d['投標廠商:投標廠商家數']);
+  const bidderCount = /^\d+$/.test(countRaw) ? parseInt(countRaw, 10) : null;
+  if (bidderCount == null || winners.length === 0) return null;
+
+  const budget = money(d['已公告資料:預算金額']);
+  const totalAward = money(d['決標資料:總決標金額']);
+  return {
+    pageType: 'award',
+    orgName: text(d['機關資料:機關名稱']),
+    caseNo: text(d['已公告資料:標案案號']),
+    tenderName: text(d['已公告資料:標案名稱']),
+    category: text(d['已公告資料:標的分類']),
+    tenderWay: text(d['已公告資料:招標方式']),
+    awardWay: text(d['已公告資料:決標方式']),
+    budget,
+    floorPrice: money(d['決標資料:底價金額']),
+    totalAward,
+    awardDate: text(d['決標資料:決標日期']),
+    awardNoticeDate: text(d['決標資料:決標公告日期']),
+    execArea: text(d['已公告資料:履約地點（含地區）']) || text(d['已公告資料:履約地點']),
+    period: winners[0]?.period ?? '',
+    bidderCount,
+    jointBid: text(d['已公告資料:是否共同投標']),
+    bidders,
+    winners,
+    losers: bidders.filter(b => b.won !== '是'),
+    discountRate: budget && totalAward ? Math.round((1 - totalAward / budget) * 10000) / 100 : null,
+  };
+}
+
+function buildNonAwardRecord(d: Record<string, any>): NonAwardDetailRecord | null {
+  const reason = text(d['無法決標公告:無法決標的理由']);
+  if (!reason) return null;
+  return {
+    pageType: 'nonAward',
+    orgName: text(d['無法決標公告:機關名稱']),
+    caseNo: text(d['無法決標公告:標案案號']),
+    tenderName: text(d['無法決標公告:標案名稱']),
+    category: text(d['無法決標公告:標的分類']),
+    reason,
+    originalBulletinDate: text(d['無法決標公告:原招標公告之刊登採購公報日期']),
+    nonAwardNoticeDate: text(d['無法決標公告:無法決標公告日期']),
+    continueSameCase: text(d['無法決標公告:是否沿用本案號及原招標方式續行招標']),
+  };
+}
+
+export interface MirrorDetailResult {
+  record?: AwardDetailRecord | NonAwardDetailRecord;
+  /** 內頁全部欄位，形狀與官方內頁解析一致 */
+  pairs?: [string, string][];
+  requests: number;
+  error?: string;
+}
+
+/**
+ * 取單案完整明細。一個案號在鏡像會有整個生命週期的多筆公告（招標→無法決標→決標），
+ * 所以用收文編號挑出要的那一筆，挑不到就當失敗，讓呼叫端回頭走官方內頁。
+ */
+export async function fetchCaseDetail(
+  ref: MirrorCaseRef,
+  filing: string,
+  wantKind: AwardDetailKind,
+): Promise<MirrorDetailResult> {
+  const url = `${BASE}/tender?unit_id=${encodeURIComponent(ref.unitId)}&job_number=${encodeURIComponent(ref.jobNumber)}`;
+  let requests = 0;
+  let lastError = '';
+
+  for (let attempt = 0; attempt <= MAX_RETRY; attempt++) {
+    const wait = THROTTLE_MS - (Date.now() - lastRequestEnd);
+    if (wait > 0) await sleep(wait);
+
+    let res;
+    try {
+      requests++;
+      res = await axios.get(url, { timeout: 60000, responseType: 'text', validateStatus: () => true, transformResponse: r => r });
+    } catch (e: any) {
+      lastRequestEnd = Date.now();
+      lastError = `連線失敗：${e.message}`;
+      await sleep(2000 * (attempt + 1));
+      continue;
+    }
+    lastRequestEnd = Date.now();
+
+    if (res.status === 429) {
+      lastError = '鏡像限速（429）';
+      await sleep(5000 * (attempt + 1));
+      continue;
+    }
+    if (res.status !== 200) {
+      lastError = `HTTP ${res.status}`;
+      await sleep(2000 * (attempt + 1));
+      continue;
+    }
+
+    let parsed: any;
+    try {
+      const body = String(res.data ?? '');
+      const start = body.indexOf('{');
+      parsed = start >= 0 ? JSON.parse(body.slice(start)) : {};
+    } catch {
+      lastError = '回應不是合法 JSON';
+      await sleep(2000 * (attempt + 1));
+      continue;
+    }
+
+    const records: any[] = Array.isArray(parsed?.records) ? parsed.records : [];
+    const hit = records.find(r => filingNumberOf(String(r?.filename ?? '')) === filing);
+    if (!hit) return { requests, error: `鏡像這個案號下找不到收文編號 ${filing} 的公告` };
+
+    const d: Record<string, any> = hit.detail ?? {};
+    const record = wantKind === 'award' ? buildAwardRecord(d) : buildNonAwardRecord(d);
+    if (!record) return { requests, error: `鏡像欄位不足以組出${wantKind === 'award' ? '決標' : '無法決標'}明細` };
+
+    const pairs: [string, string][] = Object.entries(d)
+      .filter(([k, v]) => k !== 'url' && k !== 'fetched_at' && typeof v !== 'object')
+      .map(([k, v]) => [k, String(v)]);
+    return { record, pairs, requests };
+  }
+
+  return { requests, error: lastError || '未知錯誤' };
 }

@@ -6,6 +6,8 @@ import {
   AwardBidder, AwardDetailBatch, AwardDetailInput, AwardDetailKind, AwardDetailRecord,
   AwardDetailResult, NonAwardDetailRecord,
 } from '../types/award.js';
+import { lookupAwardDate } from './award-pk-index.js';
+import { fetchDayIndex, fetchCaseDetail, filingNumberFromPk, DayIndexResult } from './mirror-client.js';
 
 /**
  * 決標公告／無法決標公告內頁（得標廠商唯一的完整來源，清單沒有廠商欄）。
@@ -15,6 +17,11 @@ import {
  * 連線錯誤也佔額度）、單次呼叫也最多 5 次、序列＋間隔 3 秒、一遇驗證碼就停整批並在冷卻期內拒絕再連線。
  * 額度與冷卻起點寫在 .cache/award-rate.json，Claude Desktop 與 Claude Code 兩個行程合計仍是同一份額度。
  * 絕不重試、絕不繞過驗證碼。
+ *
+ * 2026-09-23 起先走 g0v 鏡像：官方 pk base64 解開就是公告收文編號，而鏡像 listbydate 的 filename
+ * 尾號正是同一組數字，所以只要知道這個 pk 的決標公告日（search_awards 查過就會記在 award-pk-dates.json），
+ * 就能用「一天一請求」定位到案件，再用 /api/tender 取回與官方內頁同樣的欄位，完全不動用官方額度。
+ * 鏡像沒有、解析不出、或查不到日期的，照原本的官方內頁流程走，額度控管一字未動。
  */
 
 const SITE_ORIGIN = 'https://web.pcc.gov.tw';
@@ -568,7 +575,39 @@ function rejectReason(page: AwardPageOk, kind: AwardDetailKind, assumedKind: boo
   return '';
 }
 
-export async function fetchAwardDetails(inputs: string[], opts: { cacheFile?: string } = {}): Promise<AwardDetailBatch> {
+/**
+ * 用 pk 走鏡像取單案明細：pk → 收文編號 → （查得到決標公告日才行）當天日索引 → 案件位址 → /api/tender。
+ * 任何一步缺料就回空，呼叫端照原本的官方內頁流程走。
+ */
+async function tryMirror(
+  kind: AwardDetailKind,
+  pk: string,
+  dayCache: Map<number, DayIndexResult>,
+): Promise<{ record?: AwardDetailRecord | NonAwardDetailRecord; pairs?: [string, string][]; requests: number }> {
+  let requests = 0;
+  const filing = filingNumberFromPk(pk);
+  if (!filing) return { requests };
+
+  const date = await lookupAwardDate(pk);
+  // 這個 pk 沒被 search_awards 查過就不知道是哪一天，鏡像是按日出貨的，沒日期就走不了
+  if (date == null) return { requests };
+
+  let day = dayCache.get(date);
+  if (!day) {
+    day = await fetchDayIndex(date);
+    requests += day.requests;
+    dayCache.set(date, day);
+  }
+  const ref = day.byFiling.get(filing);
+  if (!ref) return { requests };
+
+  const detail = await fetchCaseDetail(ref, filing, kind);
+  requests += detail.requests;
+  if (!detail.record || !detail.pairs) return { requests };
+  return { record: detail.record, pairs: detail.pairs, requests };
+}
+
+export async function fetchAwardDetails(inputs: string[], opts: { cacheFile?: string; mirror?: boolean } = {}): Promise<AwardDetailBatch> {
   if (inputs.length > MAX_AWARD_CASES) {
     throw new Error(`一次最多 ${MAX_AWARD_CASES} 筆，本次給了 ${inputs.length} 筆，請分批`);
   }
@@ -584,6 +623,11 @@ export async function fetchAwardDetails(inputs: string[], opts: { cacheFile?: st
   let duplicates = 0;
   let blocked = false;
   let cooldown = false;
+  let fromMirror = 0;
+  let mirrorRequests = 0;
+  // 同一批常常是同一天的案子，日索引抓一次就好
+  const dayCache = new Map<number, DayIndexResult>();
+  const useMirror = opts.mirror ?? true;
 
   for (const input of inputs) {
     const n = normalizeAwardInput(input);
@@ -609,6 +653,19 @@ export async function fetchAwardDetails(inputs: string[], opts: { cacheFile?: st
       cachedCount++;
       results.push({ ...base, ok: true, cached: true, record: hit.record, pairs: hit.pairs, savedAt: hit.savedAt });
       continue;
+    }
+
+    // 鏡像優先：成功就不必動用官方那 10 分鐘 5 次的額度
+    if (useMirror && !blocked) {
+      const m = await tryMirror(kind, pk, dayCache);
+      mirrorRequests += m.requests;
+      if (m.record && m.pairs) {
+        fromMirror++;
+        store[key] = { kind, pk, url, record: m.record, pairs: m.pairs, savedAt: new Date().toISOString() };
+        await saveCache(file, store);
+        results.push({ ...base, ok: true, cached: false, fromMirror: true, record: m.record, pairs: m.pairs });
+        continue;
+      }
     }
 
     let r: AwardDetailResult;
@@ -657,7 +714,7 @@ export async function fetchAwardDetails(inputs: string[], opts: { cacheFile?: st
     results.push(r);
   }
 
-  return { results, fetched, cachedCount, blocked, cooldown, overLimit, duplicates };
+  return { results, fetched, cachedCount, blocked, cooldown, overLimit, duplicates, fromMirror, mirrorRequests };
 }
 
 function cooldownMessage(): string {
@@ -766,8 +823,11 @@ export function renderAwardDetails(batch: AwardDetailBatch, opts: { full?: boole
   const okCached = unique.filter(x => x.r.ok && x.r.cached).length;
 
   out += `---\n\n#### 摘要\n\n`;
-  out += `- 本次實抓 ${okFetched} 筆、快取 ${okCached} 筆、未取得 ${failed.length} 筆（本次連線內頁 ${batch.fetched} 次）`;
+  const okMirror = unique.filter(x => x.r.ok && x.r.fromMirror).length;
+  out += `- 本次實抓 ${okFetched} 筆（鏡像 ${okMirror} 筆、官方內頁 ${okFetched - okMirror} 筆）、快取 ${okCached} 筆、未取得 ${failed.length} 筆`;
+  out += `（官方內頁連線 ${batch.fetched} 次、鏡像 ${batch.mirrorRequests} 次）`;
   out += dupCount ? `；重複輸入 ${dupCount} 筆已合併\n` : '\n';
+  if (okMirror) out += `- 其中 ${okMirror} 筆取自 g0v 鏡像 pcc-api.openfun.app（資料同源於採購網），不佔官方額度；限非商業用途\n`;
   if (fullOmitted) out += `- full=true：全部欄位只列前 ${FULL_FIELDS_MAX_CASES} 筆，其餘 ${fullOmitted} 筆只給精選表\n`;
   if (failed.length) {
     out += `- 未取得：\n`;
