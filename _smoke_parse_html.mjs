@@ -4,7 +4,11 @@
 import { readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { ingestAwardHtmlFiles, fetchAwardDetails, awardDetailUrl } from './build/services/award-detail-crawler.js';
 
-const DIR = process.argv[2] ?? 'C:/Users/lt0106/Desktop/00/a';
+const DIR = process.argv[2];
+if (!DIR) {
+  console.error('用法：node _smoke_parse_html.mjs <存放人工另存決標公告 HTML 的資料夾>');
+  process.exit(2);
+}
 const CACHE = process.env.TEMP + '/_smoke_parse_html_cache.json';
 await rm(CACHE, { force: true });
 
