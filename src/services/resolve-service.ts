@@ -520,8 +520,12 @@ export async function runJob(id: string, opts: { maxMinutes?: number } = {}): Pr
       }
     }
 
-    // 2.5 補齊欄位：等廠商都處理完再做，免得跟反查搶時間
-    if (job.fullDetail && job.cases.every(c => c.status !== 'unknown')) {
+    // 2.5 補齊欄位。位置就是條件：能跑到這裡代表免費的反查與名錄都做完了，
+    // 所以排在受流量控制的內頁之前、免費步驟之後。
+    // ⚠ 不要再加「所有案子都已解」的條件：實測只要有一件廠商始終補不到（要等它
+    // 一路走到內頁、撞額度、被標成 failed），其餘案子的欄位就會一直等不到，
+    // 而那些案子的欄位跟那一件解不解得出來根本無關。
+    if (job.fullDetail) {
       const next = job.cases.find(c => c.status === 'resolved' && !c.detailed);
       if (next) {
         const r = await fillOneDetail(job, next);
