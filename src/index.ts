@@ -22,6 +22,7 @@ import {
   createJob, loadJob, listJobs, runJob, setJobState, jobSummary, seedVendorsFromCache, setJobPriority, JobPriority,
 } from "./services/resolve-service.js";
 import { rowsToExportCases, jobToExportCases, writeAwardsWorkbook, ExportCase } from "./services/award-excel.js";
+import { fillCategoriesInWorkbook, DEFAULT_MIRROR_PER_CALL } from "./services/award-category.js";
 import { buildVendorProfile, splitRange, CountRow } from "./services/vendor-profile.js";
 import { extractPk } from "./services/detail-crawler.js";
 import { hasGroqKey, NO_KEY_MESSAGE } from "./services/groq-client.js";
@@ -1362,6 +1363,46 @@ server.tool(
       return reply(out);
     } catch (error: any) {
       return reply(`解析人工存檔失敗: ${error.message}`);
+    }
+  }
+);
+
+server.tool(
+  "fill_award_category",
+  `Fill in the SUB-CODE of 標的分類 (e.g. 勞務類 / 867 建築,工程及其他技術服務(含技術監造服務) / 8672 工程服務) for every awarded case in an Excel file, writing the result to a NEW file — the source file is never modified. The award LISTING only gives the top class (勞務類); the sub-code exists only on the 決標公告 detail page, which is CAPTCHA-limited, so this tool never opens official detail pages. The sheet must have a 「pk」 column (the ?pk= part of the 決標公告 link); a 「決標公告日」 column (ROC 115/09/11 or AD) is needed for the mirror step (falls back to dates recorded by earlier search_awards calls). Per row, only if 標的細項 is still blank: (1) this server's award-detail cache — official pages and hand-saved HTML loaded by parse_award_html; these show the CURRENT notice including corrections, so they win; (2) the g0v mirror pcc-api.openfun.app (no official quota; one day-index request per distinct date plus one per case, ≥3 s apart; licensed for NON-COMMERCIAL use; may hold the PRE-correction version — measured 1 of ~400 overlapping cases differed: mirror 864, corrected notice 8672). Mirror results are cached per pk, so re-running is free. At most maxMirror cases go to the mirror per call (default ${DEFAULT_MIRROR_PER_CALL}, a few minutes); call again with the SAME path to continue — the output tells how many are still pending. Cases found nowhere (measured ~3%, mostly 契約變更 / 後續擴充 notices with -1/-2 案號 suffixes) are listed with links: the user saves each page with Ctrl+S as "Webpage, HTML Only", runs parse_award_html on the folder, then re-runs this tool. Adds/uses four columns at the right: 標的類別, 標的中類, 標的細項, 標的分類來源. 中類 groups only 52x under 「52 施工服務」 and 867x under 「867 建築,工程及其他技術服務(含技術監造服務)」 (the official code table is flat); other codes are their own 中類. Categories are what the AGENCY selected on its notice and are kept as-is even when they look wrong (e.g. a design-supervision case filed as 71 陸地運輸服務). Returns Markdown; output it verbatim.`,
+  {
+    path: z.string().describe("Excel 檔絕對路徑（要有 pk 欄；最好有 決標公告日 欄）"),
+    sheetName: z.string().optional().describe("工作表名稱；不填＝第一個有 pk 欄的工作表"),
+    maxMirror: z.number().int().min(0).max(200).optional().describe(`本次最多送幾筆去鏡像查，預設 ${DEFAULT_MIRROR_PER_CALL}（約數分鐘）；0＝只用快取`),
+    outputPath: z.string().optional().describe("輸出檔絕對路徑；不填＝來源同資料夾「原檔名_標的分類_YYYYMMDD.xlsx」，同名已存在會加時間，不覆寫"),
+  },
+  async ({ path, sheetName, maxMirror, outputPath }) => {
+    const reply = (text: string) => ({ content: [{ type: "text" as const, text }] });
+    try {
+      if (!isAbsolute(path)) return reply(`path 要給絕對路徑：${path}`);
+      if (outputPath && !isAbsolute(outputPath)) return reply(`outputPath 要給絕對路徑：${outputPath}`);
+      const r = await fillCategoriesInWorkbook({ path, sheetName, maxMirror, outputPath });
+      const filledNow = r.filled['決標公告內頁(快取)'] + r.filled['決標公告(鏡像)'];
+      const have = r.alreadyFilled + filledNow;
+      const cell = (v: unknown) => String(v ?? "").replace(/\|/g, "\\|");
+      let out = `### 標的分類補齊｜工作表「${r.sheet}」\n\n`;
+      out += `- 共 ${r.total} 案｜原本已有 ${r.alreadyFilled}｜本次補上 ${filledNow}（內頁快取 ${r.filled['決標公告內頁(快取)']}、鏡像 ${r.filled['決標公告(鏡像)']}）｜**目前 ${have}/${r.total}**\n`;
+      out += `- 鏡像請求 ${r.mirrorRequests} 次（未動用官方內頁額度）\n`;
+      if (r.pendingMirror) out += `- ⏳ **還有 ${r.pendingMirror} 案待鏡像查詢**：對同一個 path 再呼叫一次會接著查（已查過的在快取，不重查）\n`;
+      out += `- 輸出：${r.outputPath}（原檔未修改）\n`;
+      if (r.unrecognized.length) {
+        out += `\n**分類格式認不得（未寫入）：**\n`;
+        for (const u of r.unrecognized) out += `- 第 ${u.row} 列 ${cell(u.pk)}：${cell(u.raw)}\n`;
+      }
+      if (r.missing.length) {
+        out += `\n**快取與鏡像都沒有（${r.missing.length} 案）**——請逐一開啟、通過驗證碼後按 Ctrl+S 存成「網頁，僅限 HTML」放同一個資料夾，對該資料夾跑 parse_award_html，再重跑本工具：\n\n`;
+        out += `| 列 | 機關 | 案號 | 原因 | 連結 |\n|---|---|---|---|---|\n`;
+        for (const m of r.missing.slice(0, 100)) out += `| ${m.row} | ${cell(m.org)} | ${cell(m.caseNo)} | ${cell(m.why)} | [開啟](${m.url}) |\n`;
+        if (r.missing.length > 100) out += `\n（只列前 100 案，其餘 ${r.missing.length - 100} 案重跑時會再列出）\n`;
+      }
+      return reply(out);
+    } catch (error: any) {
+      return reply(`補標的分類失敗: ${error.message}`);
     }
   }
 );
