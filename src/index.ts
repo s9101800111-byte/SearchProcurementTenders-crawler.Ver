@@ -14,7 +14,7 @@ import { resolveCounties, listCounties, OTHER_LOCATION_CODE } from "./services/a
 import { ExecLocationOption } from "./types/award.js";
 import {
   fetchAwardDetails, renderAwardDetails, MAX_AWARD_FETCH_PER_CALL, MAX_AWARD_CASES,
-  DETAIL_WINDOW_MAX, DETAIL_WINDOW_MS, FULL_FIELDS_MAX_CASES, ingestAwardHtmlFiles,
+  DETAIL_WINDOW_MAX, DETAIL_WINDOW_MS, FULL_FIELDS_MAX_CASES, ingestAwardHtmlFiles, normalizeAwardInput,
 } from "./services/award-detail-crawler.js";
 import { readFile, readdir, stat } from "node:fs/promises";
 import { join as joinPath, basename } from "node:path";
@@ -22,7 +22,7 @@ import {
   createJob, loadJob, listJobs, runJob, setJobState, jobSummary, seedVendorsFromCache, setJobPriority, JobPriority,
 } from "./services/resolve-service.js";
 import { rowsToExportCases, jobToExportCases, writeAwardsWorkbook, ExportCase } from "./services/award-excel.js";
-import { fillCategoriesInWorkbook, DEFAULT_MIRROR_PER_CALL } from "./services/award-category.js";
+import { fillCategoriesInWorkbook, recheckPendingCategories, DEFAULT_MIRROR_PER_CALL } from "./services/award-category.js";
 import { buildVendorProfile, splitRange, CountRow } from "./services/vendor-profile.js";
 import { extractPk } from "./services/detail-crawler.js";
 import { hasGroqKey, NO_KEY_MESSAGE } from "./services/groq-client.js";
@@ -1403,6 +1403,59 @@ server.tool(
       return reply(out);
     } catch (error: any) {
       return reply(`補標的分類失敗: ${error.message}`);
+    }
+  }
+);
+
+server.tool(
+  "recheck_pending_awards",
+  `Re-check award cases whose 標的分類 sub-code was NOT found earlier (e.g. rows parked in a 「待查」 list with reason 鏡像未收錄 / 鏡像當日索引無此公告). fill_award_category caches such misses for 7 days, but most of them only mean the g0v mirror had not finished indexing that day yet (it catches up 1–2 days after the 決標公告日). This tool IGNORES those cached misses, FORCE-refreshes the mirror day index once per distinct date, and looks each case up again. It never opens official detail pages (no CAPTCHA quota). Per case: (1) award-detail cache (official / parse_award_html) → (2) cached mirror hit → (3) fresh mirror lookup. Hits are written back to the category cache (so fill_award_category and later runs pick them up) and returned with the sub-code split into 類別/中類/細項 plus 機關/標案名稱/得標廠商/總決標金額/投標家數 when the mirror supplies them. Cases still not found are listed with links for the manual Ctrl+S → parse_award_html route. Input: pk values or 決標公告 links, each optionally with its 決標公告日 (ROC 115/09/29 or AD); without a date the one recorded by earlier search_awards calls is used. outputJson (optional absolute path) also saves the full result as JSON for scripts. Mirror is licensed for NON-COMMERCIAL use. Returns Markdown; output it verbatim.`,
+  {
+    cases: z.array(z.object({
+      pk: z.string().describe("決標公告 pk，或含 ?pk= / ?pkAtmMain= 的連結"),
+      date: z.string().optional().describe("決標公告日，民國 115/09/29 或西元 2026-09-29；不填＝用 search_awards 記下的日期"),
+    })).min(1).max(200).describe("要重查的案子，1~200 筆"),
+    maxMirror: z.number().int().min(0).max(200).optional().describe(`本次最多送幾筆去鏡像查，預設 ${DEFAULT_MIRROR_PER_CALL}；0＝只看快取`),
+    outputJson: z.string().optional().describe("另存完整結果 JSON 的絕對路徑（給腳本讀）；不填＝不存"),
+  },
+  async ({ cases, maxMirror, outputJson }) => {
+    const reply = (text: string) => ({ content: [{ type: "text" as const, text }] });
+    try {
+      if (outputJson && !isAbsolute(outputJson)) return reply(`outputJson 要給絕對路徑：${outputJson}`);
+      const norm: { pk: string; kind: "award" | "nonAward"; date?: string }[] = [];
+      const invalid: string[] = [];
+      for (const c of cases) {
+        const n = normalizeAwardInput(c.pk);
+        if (n.ok) norm.push({ pk: n.value.pk, kind: n.value.kind, date: c.date });
+        else invalid.push(`${c.pk}：${n.message}`);
+      }
+      const r = await recheckPendingCategories({ cases: norm, maxMirror });
+      if (outputJson) {
+        await mkdirAsync(pathDirname(outputJson), { recursive: true });
+        await writeFileAsync(outputJson, JSON.stringify(r, null, 1), "utf8");
+      }
+      const cell = (v: unknown) => String(v ?? "").replace(/\|/g, "\\|");
+      const roc = (d: number | null) => d ? formatROCNumber(d) : "";
+      const money = (n: number | null | undefined) => n == null ? "" : n.toLocaleString("en-US");
+      let out = `### 待查重查（${r.total} 案）\n\n`;
+      out += `- 補到 ${r.resolved.length}｜仍查無 ${r.stillMissing.length}｜待下次 ${r.pendingMirror.length}\n`;
+      out += `- 鏡像請求 ${r.mirrorRequests} 次（未動用官方內頁額度）\n`;
+      if (outputJson) out += `- JSON：${outputJson}\n`;
+      if (r.resolved.length) {
+        out += `\n**補到的案子：**\n\n| pk | 決標公告日 | 標的細項 | 機關 | 標案名稱 | 得標廠商 | 總決標金額 | 來源 |\n|---|---|---|---|---|---|---|---|\n`;
+        for (const x of r.resolved) {
+          out += `| ${cell(x.pk)} | ${roc(x.date)} | ${cell(x.split?.item ?? x.raw)} | ${cell(x.orgName)} | ${cell(x.tenderName)} | ${cell((x.winners ?? []).map(w => w.name).join("、"))} | ${money(x.totalAward)} | ${x.source} |\n`;
+        }
+      }
+      if (r.stillMissing.length) {
+        out += `\n**仍查無（${r.stillMissing.length} 案）**——過一兩天再重查，或開連結過驗證碼後 Ctrl+S 存「網頁，僅限 HTML」，對資料夾跑 parse_award_html：\n\n| pk | 決標公告日 | 原因 | 連結 |\n|---|---|---|---|\n`;
+        for (const m of r.stillMissing) out += `| ${cell(m.pk)} | ${roc(m.date)} | ${cell(m.why)} | [開啟](${m.url}) |\n`;
+      }
+      if (r.pendingMirror.length) out += `\n⏳ **待下次（${r.pendingMirror.length} 案）**：超過 maxMirror（${maxMirror ?? DEFAULT_MIRROR_PER_CALL}）或鏡像連線／限速失敗，稍後再呼叫（maxMirror 要大於 0）：${r.pendingMirror.join("、")}\n`;
+      if (invalid.length) out += `\n**無法辨識、已略過（${invalid.length}）：**\n${invalid.map(s => `- ${cell(s)}`).join("\n")}\n`;
+      return reply(out);
+    } catch (error: any) {
+      return reply(`待查重查失敗: ${error.message}`);
     }
   }
 );

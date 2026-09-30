@@ -144,9 +144,10 @@ const DAY_CACHE_MAX = 5;
 const dayCache = new Map<number, { at: number; result: DayIndexResult }>();
 
 /** 抓某一天（民國 yyyMMdd）的全部公告，建成 機關＋案號 → 得標資訊 的索引 */
-export async function fetchDayIndex(rocDate: number): Promise<DayIndexResult> {
+export async function fetchDayIndex(rocDate: number, opts: { force?: boolean } = {}): Promise<DayIndexResult> {
   const hit = dayCache.get(rocDate);
-  if (hit && Date.now() - hit.at < DAY_CACHE_TTL_MS) {
+  // force：最近幾天鏡像還在陸續收錄，快取裡那份可能是收錄一半的舊索引
+  if (!opts.force && hit && Date.now() - hit.at < DAY_CACHE_TTL_MS) {
     // 回報 requests: 0，呼叫端的連線統計才不會把快取命中算成真的請求
     return { ...hit.result, requests: 0 };
   }

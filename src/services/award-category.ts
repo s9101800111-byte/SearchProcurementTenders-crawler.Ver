@@ -2,10 +2,11 @@ import ExcelJS from 'exceljs';
 import { readFile, writeFile, mkdir, rename, access } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, basename, extname } from 'node:path';
-import { AWARD_DETAIL_CACHE_FILE } from './award-detail-crawler.js';
+import { AWARD_DETAIL_CACHE_FILE, awardDetailUrl } from './award-detail-crawler.js';
 import { lookupAwardDate } from './award-pk-index.js';
 import { fetchDayIndex, fetchCaseDetail, filingNumberFromPk } from './mirror-client.js';
 import { toROCNumber } from '../utils/date.js';
+import { AwardDetailKind, AwardDetailRecord, NonAwardDetailRecord } from '../types/award.js';
 
 /**
  * 決標案「標的分類」細碼補齊。
@@ -213,4 +214,123 @@ export async function fillCategoriesInWorkbook(opts: CategoryFillOptions): Promi
   }
   res.outputPath = out;
   return res;
+}
+
+/**
+ * 待查重查：fillCategoriesInWorkbook 查無的案子會記 7 天 miss，但「鏡像當日索引無此公告」多半只是
+ * 鏡像還沒收錄（公告後一兩天才補齊），7 天內不會再問。這裡無視 miss、強制重抓當日索引再查一次，
+ * 查到就把分類寫回快取，順便帶回得標廠商與金額，呼叫端不必再開官方內頁。
+ */
+export interface RecheckCase { pk: string; date?: string; kind?: AwardDetailKind }
+
+export interface RecheckResolved {
+  pk: string; date: number | null; raw: string; split: SplitCategory | null; source: Source;
+  orgName?: string; caseNo?: string; tenderName?: string;
+  winners?: { name: string; vendorId: string; amount: number | null }[];
+  totalAward?: number | null; budget?: number | null; bidderCount?: number | null;
+}
+
+export interface RecheckResult {
+  total: number;
+  resolved: RecheckResolved[];
+  stillMissing: { pk: string; date: number | null; url: string; why: string }[];
+  /** 連線／限速失敗或超過 maxMirror，下次再查 */
+  pendingMirror: string[];
+  mirrorRequests: number;
+}
+
+export async function recheckPendingCategories(opts: {
+  cases: RecheckCase[];
+  maxMirror?: number;
+  detailCacheFile?: string;
+  categoryCacheFile?: string;
+}): Promise<RecheckResult> {
+  const detail = await readJson<Record<string, any>>(opts.detailCacheFile ?? AWARD_DETAIL_CACHE_FILE, {});
+  const catFile = opts.categoryCacheFile ?? CATEGORY_CACHE_FILE;
+  const catCache = await readJson<CatCache>(catFile, {});
+  const url = (kind: AwardDetailKind, pk: string) =>
+    kind === 'award' ? `https://web.pcc.gov.tw/prkms/urlSelector/common/atm?pk=${pk}` : awardDetailUrl(kind, pk);
+  const res: RecheckResult = { total: 0, resolved: [], stillMissing: [], pendingMirror: [], mirrorRequests: 0 };
+  // 寫入前重讀合併，不蓋掉別的行程剛寫的案子；別處已查到（ok）的不降級成 miss
+  const save = async (pk: string, entry: CatEntry) => {
+    const cur = await readJson<CatCache>(catFile, {});
+    if (entry.status === 'miss' && cur[pk]?.status === 'ok') return;
+    cur[pk] = entry;
+    await writeJsonAtomic(catFile, cur);
+  };
+
+  const need: { pk: string; kind: AwardDetailKind; date: number | null; badDate?: string }[] = [];
+  const seen = new Set<string>();
+  for (const c of opts.cases) {
+    const pk = c.pk.trim();
+    const kind = c.kind ?? 'award';
+    if (!pk || seen.has(pk)) continue;
+    seen.add(pk);
+    res.total++;
+    const given = toROCNumber(c.date);
+    const date = given ?? await lookupAwardDate(pk);
+    const badDate = c.date?.trim() && !given ? c.date.trim() : undefined;
+    const rec = detail[`${kind}:${pk}`]?.record;
+    if (rec?.category) {
+      res.resolved.push({ pk, date, raw: rec.category, split: splitCategory(rec.category), source: '決標公告內頁(快取)', ...pickDetail(rec) });
+      continue;
+    }
+    const cached = catCache[pk];
+    if (cached?.status === 'ok' && cached.raw) {
+      res.resolved.push({ pk, date, raw: cached.raw, split: splitCategory(cached.raw), source: '決標公告(鏡像)' });
+      continue;
+    }
+    need.push({ pk, kind, date, badDate });                     // miss 一律重查
+  }
+
+  need.sort((a, b) => (a.date ?? 0) - (b.date ?? 0));
+  const cap = opts.maxMirror ?? DEFAULT_MIRROR_PER_CALL;
+  const refreshed = new Set<number>();
+  // 某天的索引抓失敗（限速／斷線）就不再為同日其他案子重抓，免得對已在限速的鏡像連打
+  const failedDates = new Set<number>();
+  let done = 0;
+  for (const t of need) {
+    const filing = filingNumberFromPk(t.pk);
+    const link = url(t.kind, t.pk);
+    if (!filing) { res.stillMissing.push({ pk: t.pk, date: t.date, url: link, why: 'pk 不是決標公告編號' }); continue; }
+    if (!t.date) {
+      const why = t.badDate ? `日期格式認不得：${t.badDate}（請用 115/09/29 或 2026-09-29）` : '缺決標公告日（未提供，也沒被 search_awards 查過）';
+      res.stillMissing.push({ pk: t.pk, date: null, url: link, why });
+      continue;
+    }
+    if (done >= cap || failedDates.has(t.date)) { res.pendingMirror.push(t.pk); continue; }
+    done++;
+    // 同一天只強制重抓一次，之後同日的案子用剛抓的新索引
+    const day = await fetchDayIndex(t.date, { force: !refreshed.has(t.date) });
+    res.mirrorRequests += day.requests;
+    if (day.error) { failedDates.add(t.date); res.pendingMirror.push(t.pk); continue; }
+    refreshed.add(t.date);
+    const ref = day.byFiling.get(filing);
+    if (!ref) {
+      const why = '重查時鏡像當日索引仍無此公告';
+      await save(t.pk, { status: 'miss', at: new Date().toISOString(), why });
+      res.stillMissing.push({ pk: t.pk, date: t.date, url: link, why });
+      continue;
+    }
+    const d = await fetchCaseDetail(ref, filing, t.kind);
+    res.mirrorRequests += d.requests;
+    const rec = d.record;
+    if (rec?.category) {
+      await save(t.pk, { status: 'ok', raw: rec.category, at: new Date().toISOString() });
+      res.resolved.push({ pk: t.pk, date: t.date, raw: rec.category, split: splitCategory(rec.category), source: '決標公告(鏡像)', ...pickDetail(rec) });
+    } else if (/找不到|欄位不足/.test(d.error ?? '')) {
+      await save(t.pk, { status: 'miss', at: new Date().toISOString(), why: d.error });
+      res.stillMissing.push({ pk: t.pk, date: t.date, url: link, why: d.error ?? '鏡像欄位不足' });
+    } else res.pendingMirror.push(t.pk);
+  }
+  return res;
+}
+
+function pickDetail(rec: AwardDetailRecord | NonAwardDetailRecord) {
+  if (rec.pageType !== 'award') return { orgName: rec.orgName, caseNo: rec.caseNo, tenderName: rec.tenderName };
+  return {
+    orgName: rec.orgName, caseNo: rec.caseNo, tenderName: rec.tenderName,
+    winners: (rec.winners ?? []).map(w => ({ name: w.name, vendorId: w.vendorId, amount: w.amount })),
+    totalAward: rec.totalAward, budget: rec.budget, bidderCount: rec.bidderCount,
+  };
 }
