@@ -158,6 +158,16 @@ function parseFields(html: string): Record<string, string> {
       fields[k] = $(tds[1]).text().trim().replace(/\s+/g, ' ');
     }
   });
+  return normalizeFields(fields);
+}
+
+/**
+ * 「決標方式」格內嵌評選委員名單按鈕（同 award-detail-crawler 的註解），text() 會把按鈕字樣黏在值尾端。
+ * 快取命中時也要套用：2026-10-02 修正前寫入的快取帶著這段尾巴。
+ */
+function normalizeFields(fields: Record<string, string>): Record<string, string> {
+  const v = fields['決標方式'];
+  if (v) fields['決標方式'] = v.replace(/\s*採購評選委員名單\s*$/, '');
   return fields;
 }
 
@@ -213,7 +223,7 @@ export async function fetchTenderDetails(inputs: string[]): Promise<{ details: T
 
     const hit = store[pk];
     if (hit) {
-      details.push({ input, pk, url, ok: true, fields: hit.fields, cached: true });
+      details.push({ input, pk, url, ok: true, fields: normalizeFields({ ...hit.fields }), cached: true });
       continue;
     }
 

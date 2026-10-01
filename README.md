@@ -67,6 +67,21 @@ npm run build
 - 「最近有哪些『新建工程』的標案快截止了？」
 - 「列出預算金額超過 100 萬的標案。」
 
+## 大量回填內頁 (Bulk Detail Backfill)
+`get_tender_detail` 有流量保護（單次 8 筆、任意 5 分鐘 20 筆），不適合一次補幾十上百筆。大量回填改用獨立腳本：
+
+```bash
+npm run build
+node scripts/backfill-details.mjs pks.json --gap 20 --out results.json
+```
+
+- `pks.json`：JSON 陣列或一行一筆，pk 或 `tpam?pk=` 連結皆可。
+- `--gap`：連線間隔秒數，最低 15。已快取的案子不連線、不占間隔。
+- 每筆寫入 `--out` 檔；中斷後用同一個輸出檔重跑，已成功的會跳過。
+- 撞到驗證碼立即整批停止（exit code 3），**不要重試、不要嘗試繞過**，冷卻 20 分鐘以上再續跑。
+
+實測（2026-10-01）：20 秒間隔連續抓 56 筆未遭封鎖。同一 IP 短時間大量請求會被鎖，間隔不要再縮短。
+
 ## 關於作者 (About the Author)
 - **作者**: 加號設計數位工程有限公司 HJPLUS.DESIGN
 - **網站**: [加號設計數位工程有限公司](https://hjplus.design)
