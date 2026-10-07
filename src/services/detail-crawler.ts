@@ -13,7 +13,7 @@ import { TenderDetail } from '../types/tender.js';
  * 之後連先前成功過的頁面也一律被擋，降低間隔也救不回來（要等冷卻）。
  * 因此這裡的策略是「省著用」而不是「想辦法多抓」：
  *   1. 本地快取，同一案永不重抓
- *   2. 單次上限 8 筆、序列抓取並節流
+ *   2. 單次上限 8 筆、任兩次請求至少隔 20 秒（跨呼叫共用）
  *   3. 跨呼叫滾動額度（5 分鐘 20 次）——單次上限擋不住「連續呼叫十次」
  *   4. 一遇驗證碼立刻中止整批，並冷卻 20 分鐘才再送請求；未完成的誠實回報
  * 絕不繞過或破解驗證碼。
@@ -23,14 +23,29 @@ const DETAIL_BASE = 'https://web.pcc.gov.tw/tps/QueryTender/query/searchTenderDe
 
 /** 單次最多抓幾筆未快取的案子 */
 export const MAX_FETCH_PER_CALL = 8;
-/** 連續請求間隔（毫秒） */
-const THROTTLE_MS = 1500;
+/**
+ * 任兩次請求的最小間隔（跨呼叫共用）。原本單次呼叫內只隔 1.5 秒，8 筆會在 10 秒內連發，
+ * 2026-10 手機與公司 IP 都因連發被鎖、隔 3 天仍未解；20 秒間隔則實測連抓 56 筆不被擋。
+ */
+export const MIN_GAP_MS = 20 * 1000;
+let lastRequestAt = 0;
+let gapQueue: Promise<void> = Promise.resolve();
+
+/** 排隊等到距上次實際送出滿 MIN_GAP_MS；並行呼叫也一個一個來 */
+function waitForGap(): Promise<void> {
+  const turn = gapQueue.then(async () => {
+    while (Date.now() < lastRequestAt + MIN_GAP_MS) await sleep(lastRequestAt + MIN_GAP_MS - Date.now()); // Windows 計時器會早到幾毫秒
+    lastRequestAt = Date.now();
+  });
+  gapQueue = turn;
+  return turn;
+}
 
 /**
  * 跨呼叫的滾動額度。單次上限只擋得住一次呼叫，擋不住「連續呼叫十次」——
  * 決標內頁就是這樣被鎖掉的（2026-09-14 起連鎖多日），而招標內頁是目前唯一還能用的內頁。
  * 額度取自 2026-09-22 實測：15 秒間隔連抓 17 筆未被擋 → 平均 15 秒/筆＝5 分鐘 20 筆，
- * 既維持互動查詢的手感（單次 8 筆仍是 1.5 秒間隔、12 秒抓完），又擋掉把 MCP 當爬蟲用的情境。
+ * 擋掉把 MCP 當爬蟲用的情境（MIN_GAP_MS 生效後此額度實際不會滿，留著當第二道保險）。
  * 大量補資料請寫獨立腳本，不要迴圈呼叫本工具。
  */
 export const TENDER_WINDOW_MAX = 20;
@@ -50,6 +65,7 @@ export function resetTenderDetailWindow(seedUsed = 0, seedBlockedMs = 0): void {
   const now = Date.now();
   windowStamps = Array.from({ length: seedUsed }, () => now);
   blockedUntil = seedBlockedMs ? now + seedBlockedMs : 0;
+  lastRequestAt = 0;
 }
 
 /** 目前額度狀態（驗收與回報用）。used 是滾動視窗內已送出的請求數 */
@@ -250,7 +266,7 @@ export async function fetchTenderDetails(inputs: string[]): Promise<{ details: T
       continue;
     }
 
-    if (fetched > 0) await sleep(THROTTLE_MS);
+    await waitForGap();
     windowStamps.push(Date.now());
     const r = await fetchOne(pk);
     fetched++;
