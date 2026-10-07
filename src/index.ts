@@ -204,7 +204,7 @@ server.tool(
       if (failed.length > 0) {
         out += `---\n\n**以下 ${failed.length} 筆未取得，請自行點開確認：**\n\n`;
         failed.forEach(d => {
-          const why = d.reason === 'captcha' ? '網站流量控制（驗證碼）'
+          const why = d.reason === 'captcha' ? (d.message || '網站流量控制（驗證碼）')
             : d.reason === 'award' ? (d.message || '這是決標類公告連結，請改用 get_award_detail')
             : d.reason === 'parse' ? (d.message || '內頁版型不符，可能非一般招標公告')
             : d.message || '連線失敗';
