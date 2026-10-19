@@ -3,6 +3,7 @@ import { mkdir, readFile, writeFile, readdir, rename, unlink } from 'node:fs/pro
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { groqChat, extractJsonArray, GroqError, GroqUsage, GROQ_MODEL, newUsage } from './groq-client.js';
+import { jevAsk, jevQuestion, noulToScore, JevError, JEV_MODEL, JEV_CONCURRENCY } from './jev-client.js';
 
 /**
  * 依主題把一批標案／決標案分成 A 必納／B AI 補抓／C 低分。
@@ -23,6 +24,7 @@ export const BATCH_SIZE = 12;
 export const MAX_RECHECK = 40;
 
 export type RankGroup = 'A' | 'B' | 'C';
+export type RankEngine = 'groq' | 'jev';
 
 export interface RankItem {
   /** 決標 pk 或招標 pk；同一個 ranking 內唯一 */
@@ -51,6 +53,8 @@ export interface RankJob {
   state: 'running' | 'paused' | 'done' | 'error';
   message: string;
   model: string;
+  /** 舊版工作檔沒有這欄＝groq */
+  engine?: RankEngine;
   items: RankItem[];
   /** 單筆複查用的主題詞（AI 產生），第一次跑時才產 */
   recheckTerms?: string[];
@@ -62,12 +66,14 @@ export interface RankJob {
 const nowIso = () => new Date().toISOString();
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-// ---------- 分數快取（同模型＋同主題＋同機關名稱＋同標案名稱，不重算） ----------
+// ---------- 分數快取（同引擎＋同模型＋同主題＋同機關名稱＋同標案名稱，不重算） ----------
 
 let scoreCache: Record<string, number> | null = null;
 
-function scoreKey(topic: string, orgName: string, tenderName: string): string {
-  return createHash('sha1').update(`${GROQ_MODEL}\u0000${topic.trim()}\u0000${orgName}\u0000${tenderName}`).digest('hex');
+/** groq 的 key 維持舊格式，既有快取繼續有效；jev 加前綴區分 */
+function scoreKey(topic: string, orgName: string, tenderName: string, engine: RankEngine = 'groq'): string {
+  const model = engine === 'jev' ? `jev:${JEV_MODEL}` : GROQ_MODEL;
+  return createHash('sha1').update(`${model}\u0000${topic.trim()}\u0000${orgName}\u0000${tenderName}`).digest('hex');
 }
 
 async function loadScoreCache(): Promise<Record<string, number>> {
@@ -90,8 +96,9 @@ async function atomicWrite(file: string, text: string): Promise<void> {
 
 // ---------- 工作檔 ----------
 
-export function makeRankId(topic: string, keywords: string[], pks: string[]): string {
-  const h = createHash('sha1').update(`${topic}\u0000${keywords.join(',')}\u0000${pks.join(',')}`).digest('hex');
+export function makeRankId(topic: string, keywords: string[], pks: string[], engine: RankEngine = 'groq'): string {
+  // groq 不加引擎字樣，舊 rankId 不變
+  const h = createHash('sha1').update(`${engine === 'jev' ? 'jev\u0000' : ''}${topic}\u0000${keywords.join(',')}\u0000${pks.join(',')}`).digest('hex');
   return `rank_${h.slice(0, 10)}`;
 }
 
@@ -118,8 +125,9 @@ export async function listRankJobs(): Promise<RankJob[]> {
 
 export async function createRankJob(input: {
   topic: string; keywords: string[]; source: RankJob['source']; conditions: string;
-  items: Omit<RankItem, 'score'>[];
+  items: Omit<RankItem, 'score'>[]; engine?: RankEngine;
 }): Promise<RankJob> {
+  const engine = input.engine ?? 'groq';
   const seen = new Set<string>();
   const items: RankItem[] = [];
   for (const it of input.items) {
@@ -127,12 +135,13 @@ export async function createRankJob(input: {
     seen.add(it.pk);
     items.push({ ...it, score: -1 });
   }
-  const id = makeRankId(input.topic, input.keywords, items.map(i => i.pk));
+  const id = makeRankId(input.topic, input.keywords, items.map(i => i.pk), engine);
   const existing = await loadRankJob(id);
   if (existing) return existing;
   const job: RankJob = {
     id, topic: input.topic.trim(), keywords: input.keywords, source: input.source, conditions: input.conditions,
-    createdAt: nowIso(), updatedAt: nowIso(), state: 'paused', message: '尚未開始', model: GROQ_MODEL,
+    createdAt: nowIso(), updatedAt: nowIso(), state: 'paused', message: '尚未開始',
+    model: engine === 'jev' ? JEV_MODEL : GROQ_MODEL, engine,
     items, usage: newUsage(),
   };
   assignGroups(job);
@@ -232,6 +241,39 @@ async function scoreList(job: RankJob, list: RankItem[], deadline: number, cache
 
 const running = new Set<string>();
 
+/**
+ * jev：一案一請求、8 併發。每 40 筆存一次檔；被暫停回 false。
+ * 回錯格式的案子標 rechecked 留 -1，後面的 groq 批次迴圈就不會再碰它。
+ */
+async function runJevScoring(job: RankJob, deadline: number, cache: Record<string, number>): Promise<boolean> {
+  const question = jevQuestion(job.topic);
+  const todo = job.items.filter(it => it.score < 0 && !it.rechecked);
+  let next = 0, sinceSave = 0;
+  let saving: Promise<void> = Promise.resolve();
+  const checkpoint = async () => {
+    assignGroups(job);
+    job.message = `逐案評分 ${job.items.filter(it => it.score >= 0).length}/${job.items.length}`;
+    await persist(job);
+    await saveScoreCache();
+  };
+  const worker = async () => {
+    while (next < todo.length && job.state === 'running') {
+      const it = todo[next++];
+      const p = await jevAsk(question, it.orgName, it.tenderName, job.usage, deadline);
+      if (p == null) it.rechecked = true;
+      else {
+        it.score = noulToScore(p);
+        cache[scoreKey(job.topic, it.orgName, it.tenderName, 'jev')] = it.score;
+      }
+      if (++sinceSave >= 40) { sinceSave = 0; saving = saving.then(checkpoint); await saving; }
+    }
+  };
+  await Promise.all(Array.from({ length: JEV_CONCURRENCY }, worker));
+  await saving;
+  await checkpoint();
+  return job.state === 'running';
+}
+
 /** 存檔前保留檔案上的暫停狀態：stop 是另一次工具呼叫寫進檔案的，不能被背景迴圈的舊狀態蓋掉 */
 async function persist(job: RankJob): Promise<void> {
   const cur = await loadRankJob(job.id);
@@ -265,12 +307,18 @@ export async function runRankJob(id: string, opts: { maxMinutes?: number } = {})
     if (!job) return;
     const cache = await loadScoreCache();
 
+    const engine = job.engine ?? 'groq';
     let fromCache = 0;
     for (const it of job.items) {
-      const k = scoreKey(job.topic, it.orgName, it.tenderName);
+      const k = scoreKey(job.topic, it.orgName, it.tenderName, engine);
       if (it.score < 0 && cache[k] !== undefined) { it.score = cache[k]; fromCache++; }
     }
     if (fromCache) { assignGroups(job); job.message = `從快取取得 ${fromCache} 筆分數`; await persist(job); }
+
+    if (engine === 'jev') {
+      if (!(await runJevScoring(job, deadline, cache))) return;
+      job.recheckDone = true;  // 已是一案一問，不需要單筆複查
+    }
 
     for (;;) {
       if (job.state !== 'running') return;
@@ -323,8 +371,9 @@ export async function runRankJob(id: string, opts: { maxMinutes?: number } = {})
   } catch (e: any) {
     const job = await loadRankJob(id);
     if (job) {
-      job.state = e instanceof GroqError && e.kind === 'deadline' ? 'paused' : 'error';
-      job.message = e instanceof GroqError && e.kind === 'deadline'
+      const isDeadline = (e instanceof GroqError || e instanceof JevError) && e.kind === 'deadline';
+      job.state = isDeadline ? 'paused' : 'error';
+      job.message = isDeadline
         ? '達到本次執行時間上限，可再次 start 續跑（已評分的不重算）'
         : `執行失敗：${e.message}`;
       await saveRankJob(job);
@@ -352,12 +401,13 @@ export function rankSummary(job: RankJob): string {
   // 免費額度 8,000 TPM；以已評分筆數推估剩餘時間
   const perItem = c.scored ? (u.promptTokens + u.completionTokens) / Math.max(1, c.scored) : 250;
   const remainMin = Math.ceil(((c.total - c.scored) * perItem) / 8000);
+  const jev = job.engine === 'jev';
   return [
     `- 狀態：${job.state === 'running' ? '執行中' : job.state === 'done' ? '已完成' : job.state === 'paused' ? '已暫停' : '錯誤'}｜${job.message}`,
     `- 主題：${job.topic}｜必納關鍵字：${job.keywords.length ? job.keywords.join('、') : '（未給）'}`,
-    `- 評分：${fmt(c.scored)} / ${fmt(c.total)} 筆${job.state === 'running' && c.total > c.scored ? `（免費額度下約還要 ${remainMin} 分鐘）` : ''}`,
+    `- 評分：${fmt(c.scored)} / ${fmt(c.total)} 筆${job.state === 'running' && c.total > c.scored && !jev ? `（免費額度下約還要 ${remainMin} 分鐘）` : ''}`,
     `- 分組：A 必納 ${fmt(c.A)}｜B AI 補抓 ${fmt(c.B)}｜C 低分 ${fmt(c.C)}`,
-    `- Groq：${fmt(u.calls)} 次呼叫｜輸入 ${fmt(u.promptTokens)}／輸出 ${fmt(u.completionTokens)} token｜等待限速 ${Math.round(u.waitedMs / 1000)} 秒｜模型 ${job.model}`,
+    `- ${jev ? 'Jev（TypeSafe，逐案）' : 'Groq'}：${fmt(u.calls)} 次呼叫｜輸入 ${fmt(u.promptTokens)}／輸出 ${fmt(u.completionTokens)} token｜等待${jev ? '重試' : '限速'} ${Math.round(u.waitedMs / 1000)} 秒｜模型 ${job.model}`,
     `- 資料範圍：${job.conditions}`,
   ].join('\n');
 }

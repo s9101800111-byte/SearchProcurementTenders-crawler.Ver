@@ -26,6 +26,7 @@ import { fillCategoriesInWorkbook, recheckPendingCategories, DEFAULT_MIRROR_PER_
 import { buildVendorProfile, splitRange, CountRow } from "./services/vendor-profile.js";
 import { extractPk } from "./services/detail-crawler.js";
 import { hasGroqKey, NO_KEY_MESSAGE } from "./services/groq-client.js";
+import { hasJevKey, NO_JEV_KEY_MESSAGE } from "./services/jev-client.js";
 import {
   createRankJob, loadRankJob, listRankJobs, runRankJob, setRankState, rankSummary, rankCounts, compareRank, RankItem, BATCH_SIZE, MAX_RECHECK,
   suggestTerms,
@@ -951,12 +952,13 @@ const RANK_EXPORT_DIR = pathJoin(pathDirname(fileURLToPath(import.meta.url)), ".
 
 server.tool(
   "rank_by_topic",
-  `Sort a whole list of tenders or awarded cases by TOPIC using an LLM on Groq (needs env GROQ_API_KEY; all other tools work without it), so rate-limited detail pages are spent on the right cases. It reads ONLY 機關名稱 + 標案名稱 — it never opens detail pages and never changes any site data. Every case lands in one group: A 必納 = tender name contains one of the given keywords (ALWAYS kept, the AI score can never remove it); B AI 補抓 = no keyword hit but AI score ≥2 (catches cases keywords miss — MUST be confirmed by a human, not used directly for statistics); C 低分 = neither (kept, listed last, never deleted). Runs as a BACKGROUND JOB with a persisted state file: action="start" returns a rankId immediately, poll action="status", then action="result" for tables + CSV/JSON export. Pass the rankId to resolve_award_vendors or get_tender_detail to fetch A→B→C. Case list comes from exactly one of: source="awards" (same filters as search_awards), source="tenders" (same filters as search_tenders, open-for-bidding only), or exportFile (absolute path of a JSON written by search_awards/export). MEASURED 2026-09-17 on 2,031 勞務 awards (topic 工程技術服務, compared with keyword labels + manual adjudication): the AI found ~27 real cases keywords missed but ~70 of its 436 positives were wrong (mostly the construction/maintenance work itself, not the service); in 40-item batches it scored obvious 「…委託監造設計案」 as 0 while a single re-ask gave 3, so this tool uses ${BATCH_SIZE}-item batches and re-asks (up to ${MAX_RECHECK}) low-scored cases whose name contains an AI-suggested topic term. Speed is bounded by the free Groq quota (~8,000 tokens/min ≈ 2,000 cases in ~17 min); scores are cached per model+topic+name, so re-runs and resumes are free. Tell the user: B needs review; A cases the AI scored low are listed for review too (keyword false positives). Output Markdown verbatim.`,
+  `Sort a whole list of tenders or awarded cases by TOPIC using an LLM on Groq (needs env GROQ_API_KEY; all other tools work without it), so rate-limited detail pages are spent on the right cases. It reads ONLY 機關名稱 + 標案名稱 — it never opens detail pages and never changes any site data. Every case lands in one group: A 必納 = tender name contains one of the given keywords (ALWAYS kept, the AI score can never remove it); B AI 補抓 = no keyword hit but AI score ≥2 (catches cases keywords miss — MUST be confirmed by a human, not used directly for statistics); C 低分 = neither (kept, listed last, never deleted). Runs as a BACKGROUND JOB with a persisted state file: action="start" returns a rankId immediately, poll action="status", then action="result" for tables + CSV/JSON export. Pass the rankId to resolve_award_vendors or get_tender_detail to fetch A→B→C. Case list comes from exactly one of: source="awards" (same filters as search_awards), source="tenders" (same filters as search_tenders, open-for-bidding only), or exportFile (absolute path of a JSON written by search_awards/export). MEASURED 2026-09-17 on 2,031 勞務 awards (topic 工程技術服務, compared with keyword labels + manual adjudication): the AI found ~27 real cases keywords missed but ~70 of its 436 positives were wrong (mostly the construction/maintenance work itself, not the service); in 40-item batches it scored obvious 「…委託監造設計案」 as 0 while a single re-ask gave 3, so this tool uses ${BATCH_SIZE}-item batches and re-asks (up to ${MAX_RECHECK}) low-scored cases whose name contains an AI-suggested topic term. Speed is bounded by the free Groq quota (~8,000 tokens/min ≈ 2,000 cases in ~17 min); scores are cached per model+topic+name, so re-runs and resumes are free. engine="jev" uses TypeSafe Jev instead (env TYPESAFE_API_KEY, paid, ~US$0.05 per 2,000 cases): ONE request per case, 8 concurrent, no batching and no re-ask needed; MEASURED 2026-10-19 on the same 2,031 awards it finished in 48 s, agreed with 337 of the 341 keyword-labelled cases, added ~45 high-confidence real services, and correctly rejected the dredging/user-installation work Groq got wrong — prefer it when the key exists. Its 0~1 probability maps to the same 0~3 score (≥0.8→3, ≥0.5→2, ≥0.3→1). Tell the user: B needs review; A cases the AI scored low are listed for review too (keyword false positives). Output Markdown verbatim.`,
   {
     action: z.enum(["start", "status", "stop", "result", "list"]).describe("start=建立或續跑｜status=查進度｜stop=暫停｜result=取分組結果與匯出｜list=列出所有排名工作"),
     rankId: z.string().optional().describe("status／stop／result 必填；start 帶上則續跑"),
     topic: z.string().optional().describe("start 用：一句話描述要找什麼，例：「工程技術服務（規劃、設計、監造、專案管理、檢測鑑定）」「室內裝修工程」"),
     keywords: z.array(z.string()).optional().describe("start 用：必納關鍵字，標案名稱含任一個就進 A 組、AI 不能移出，例：['監造','委託技術服務']"),
+    engine: z.enum(["groq", "jev"]).optional().describe("start 用：groq（預設，免費但受每分鐘額度限制）｜jev（TypeSafe，需 TYPESAFE_API_KEY，逐案判斷、快且準，2,000 筆約 0.05 美元）。續跑既有 rankId 時沿用原引擎"),
     source: z.enum(["awards", "tenders"]).optional().describe("start 用：awards＝決標案（同 search_awards 條件）｜tenders＝等標期內招標案（同 search_tenders 條件）。給 exportFile 時不用填"),
     exportFile: z.string().optional().describe("start 用：search_awards 匯出的 JSON 絕對路徑（.cache/exports/awards_*.json），給了就不重新查清單"),
     from: z.string().optional().describe("awards：決標公告日起"),
@@ -1044,9 +1046,10 @@ server.tool(
       }
 
       // ---- start ----
-      if (!hasGroqKey()) return reply(NO_KEY_MESSAGE);
       let job = rankId ? await loadRankJob(rankId) : null;
       if (rankId && !job) return reply(`找不到排名工作 ${rankId}。`);
+      const engine = job ? (job.engine ?? "groq") : (args.engine ?? "groq");
+      if (engine === "jev" ? !hasJevKey() : !hasGroqKey()) return reply(engine === "jev" ? NO_JEV_KEY_MESSAGE : NO_KEY_MESSAGE);
       if (!job) {
         const topic = args.topic?.trim();
         if (!topic) return reply(`start 需要 topic（一句話描述要找的主題）。`);
@@ -1095,13 +1098,13 @@ server.tool(
           return reply(`start 需要案件來源：source="awards"、source="tenders"，或 exportFile。`);
         }
 
-        job = await createRankJob({ topic, keywords, source, conditions, items });
+        job = await createRankJob({ topic, keywords, source, conditions, items, engine });
       }
 
       if (job.state === "done") return reply(`### 這個排名已完成 \`${job.id}\`\n\n${rankSummary(job)}\n\n> 用 action="result" 取分組結果。`);
       const started = await setRankState(job.id, "running");
       void runRankJob(job.id).catch(() => undefined);
-      return reply(`### 已啟動主題排名 \`${job.id}\`\n\n${rankSummary(started ?? job)}\n\n> 背景執行中，用 \`action="status", rankId="${job.id}"\` 查進度、\`action="result"\` 取結果。每 ${BATCH_SIZE} 筆一批，被 Groq 限速時自動等待；重開 Claude 會中斷，用同一個 rankId 再 start 即可續跑（已評分的不重算）。`);
+      return reply(`### 已啟動主題排名 \`${job.id}\`\n\n${rankSummary(started ?? job)}\n\n> 背景執行中，用 \`action="status", rankId="${job.id}"\` 查進度、\`action="result"\` 取結果。${engine === "jev" ? "Jev 逐案判斷、8 併發，2,000 筆約 1 分鐘" : `每 ${BATCH_SIZE} 筆一批，被 Groq 限速時自動等待`}；重開 Claude 會中斷，用同一個 rankId 再 start 即可續跑（已評分的不重算）。`);
     } catch (error: any) {
       return reply(`主題排名失敗: ${error.message}`);
     }

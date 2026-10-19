@@ -18,25 +18,32 @@ export class GroqError extends Error {
   }
 }
 
-let registryKey: string | null | undefined;
+const registryCache = new Map<string, string | null>();
 
 /**
  * Claude Desktop 啟動 MCP 時只傳一小部分環境變數，使用者層級的 GROQ_API_KEY 進不來（2026-09-17 實測）。
  * Windows 上退而讀 HKCU\Environment，金鑰就不必以明文寫進 MCP 設定檔。值只放記憶體，不輸出。
+ * TYPESAFE_API_KEY（rank_by_topic 的 jev 引擎）同理。
  */
-function groqKey(): string | undefined {
-  const fromEnv = process.env.GROQ_API_KEY?.trim();
+export function envOrRegistry(name: string): string | undefined {
+  const fromEnv = process.env[name]?.trim();
   if (fromEnv) return fromEnv;
   if (process.platform !== 'win32') return undefined;
-  if (registryKey === undefined) {
+  if (!registryCache.has(name)) {
+    let v: string | null = null;
     try {
-      const out = execFileSync('reg', ['query', String.raw`HKCU\Environment`, '/v', 'GROQ_API_KEY'], { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
-      registryKey = out.match(/GROQ_API_KEY\s+REG_(?:EXPAND_)?SZ\s+(\S+)/)?.[1] ?? null;
+      const out = execFileSync('reg', ['query', String.raw`HKCU\Environment`, '/v', name], { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+      v = out.match(new RegExp(`${name}\\s+REG_(?:EXPAND_)?SZ\\s+(\\S+)`))?.[1] ?? null;
     } catch {
-      registryKey = null;
+      v = null;
     }
+    registryCache.set(name, v);
   }
-  return registryKey ?? undefined;
+  return registryCache.get(name) ?? undefined;
+}
+
+function groqKey(): string | undefined {
+  return envOrRegistry('GROQ_API_KEY');
 }
 
 export function hasGroqKey(): boolean {
