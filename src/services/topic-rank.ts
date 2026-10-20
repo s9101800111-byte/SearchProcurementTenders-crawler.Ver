@@ -2,8 +2,8 @@ import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile, readdir, rename, unlink } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { groqChat, extractJsonArray, GroqError, GroqUsage, GROQ_MODEL, newUsage } from './groq-client.js';
-import { jevAsk, jevQuestion, noulToScore, JevError, JEV_MODEL, JEV_CONCURRENCY } from './jev-client.js';
+import { groqChat, extractJsonArray, GroqError, GroqUsage, GROQ_MODEL, newUsage, hasGroqKey } from './groq-client.js';
+import { jevAsk, jevQuestion, noulToScore, JevError, JEV_MODEL, JEV_CONCURRENCY, hasJevKey } from './jev-client.js';
 
 /**
  * 依主題把一批標案／決標案分成 A 必納／B AI 補抓／C 低分。
@@ -38,6 +38,8 @@ export interface RankItem {
   /** -1＝未評分（執行中斷或模型一直回錯格式） */
   score: number;
   rechecked?: boolean;
+  /** 實際給分的引擎；工作的引擎失敗時會改由另一個補分，所以可能和 job.engine 不同 */
+  engine?: RankEngine;
   keywordHits?: string[];
   group?: RankGroup;
 }
@@ -60,6 +62,8 @@ export interface RankJob {
   recheckTerms?: string[];
   recheckDone?: boolean;
   recheckSkipped?: number;
+  /** 改送另一個引擎時的說明 */
+  fallbackNote?: string;
   usage: GroqUsage;
 }
 
@@ -228,7 +232,7 @@ async function scoreBatch(topic: string, list: RankItem[], usage: GroqUsage, dea
 async function scoreList(job: RankJob, list: RankItem[], deadline: number, cache: Record<string, number>): Promise<void> {
   const got = await scoreBatch(job.topic, list, job.usage, deadline);
   if (got) {
-    list.forEach((it, k) => { it.score = got[k]; cache[scoreKey(job.topic, it.orgName, it.tenderName)] = got[k]; });
+    list.forEach((it, k) => { it.score = got[k]; it.engine = 'groq'; cache[scoreKey(job.topic, it.orgName, it.tenderName)] = got[k]; });
     return;
   }
   if (list.length === 1) return;
@@ -241,13 +245,19 @@ async function scoreList(job: RankJob, list: RankItem[], deadline: number, cache
 
 const running = new Set<string>();
 
+const pending = (job: RankJob) => job.items.filter(it => it.score < 0 && !it.rechecked);
+
+/** Groq 等限速會超過時間上限、改送 Jev 時，Jev 另給的時間（2,000 筆實測 48 秒） */
+const JEV_FALLBACK_GRACE_MS = 5 * 60_000;
+
 /**
- * jev：一案一請求、8 併發。每 40 筆存一次檔；被暫停回 false。
+ * jev：一案一請求、8 併發。每 40 筆存一次檔；running=false 表示被暫停。
  * 回錯格式的案子標 rechecked 留 -1，後面的 groq 批次迴圈就不會再碰它。
+ * 逾時／5xx 重試用完／金鑰被拒時不丟錯：停止再打 Jev，剩下的留 -1 交給呼叫端改送 Groq，錯誤放 error 回傳。
  */
-async function runJevScoring(job: RankJob, deadline: number, cache: Record<string, number>): Promise<boolean> {
+async function runJevScoring(job: RankJob, todo: RankItem[], deadline: number, cache: Record<string, number>): Promise<{ running: boolean; error?: JevError }> {
   const question = jevQuestion(job.topic);
-  const todo = job.items.filter(it => it.score < 0 && !it.rechecked);
+  let failed: JevError | undefined;
   let next = 0, sinceSave = 0;
   let saving: Promise<void> = Promise.resolve();
   const checkpoint = async () => {
@@ -257,12 +267,19 @@ async function runJevScoring(job: RankJob, deadline: number, cache: Record<strin
     await saveScoreCache();
   };
   const worker = async () => {
-    while (next < todo.length && job.state === 'running') {
+    while (next < todo.length && job.state === 'running' && !failed) {
       const it = todo[next++];
-      const p = await jevAsk(question, it.orgName, it.tenderName, job.usage, deadline);
+      let p: number | null;
+      try {
+        p = await jevAsk(question, it.orgName, it.tenderName, job.usage, deadline);
+      } catch (e) {
+        if (e instanceof JevError && e.kind !== 'deadline') { failed ??= e; break; }
+        throw e;
+      }
       if (p == null) it.rechecked = true;
       else {
         it.score = noulToScore(p);
+        it.engine = 'jev';
         cache[scoreKey(job.topic, it.orgName, it.tenderName, 'jev')] = it.score;
       }
       if (++sinceSave >= 40) { sinceSave = 0; saving = saving.then(checkpoint); await saving; }
@@ -271,7 +288,7 @@ async function runJevScoring(job: RankJob, deadline: number, cache: Record<strin
   await Promise.all(Array.from({ length: JEV_CONCURRENCY }, worker));
   await saving;
   await checkpoint();
-  return job.state === 'running';
+  return { running: job.state === 'running', error: failed };
 }
 
 /** 存檔前保留檔案上的暫停狀態：stop 是另一次工具呼叫寫進檔案的，不能被背景迴圈的舊狀態蓋掉 */
@@ -311,22 +328,47 @@ export async function runRankJob(id: string, opts: { maxMinutes?: number } = {})
     let fromCache = 0;
     for (const it of job.items) {
       const k = scoreKey(job.topic, it.orgName, it.tenderName, engine);
-      if (it.score < 0 && cache[k] !== undefined) { it.score = cache[k]; fromCache++; }
+      if (it.score < 0 && cache[k] !== undefined) { it.score = cache[k]; it.engine = engine; fromCache++; }
     }
     if (fromCache) { assignGroups(job); job.message = `從快取取得 ${fromCache} 筆分數`; await persist(job); }
 
     if (engine === 'jev') {
-      if (!(await runJevScoring(job, deadline, cache))) return;
+      const r = await runJevScoring(job, pending(job), deadline, cache);
+      if (!r.running) return;
       job.recheckDone = true;  // 已是一案一問，不需要單筆複查
+      if (r.error) {
+        // Jev 失敗的那幾筆留 -1，由下面的 groq 批次迴圈接手
+        const rest = pending(job);
+        if (hasGroqKey()) {
+          job.fallbackNote = `Jev 失敗（${r.error.message}），${rest.length} 筆改送 Groq`;
+        } else {
+          for (const it of rest) it.rechecked = true;
+          job.fallbackNote = `Jev 失敗（${r.error.message}），又找不到 GROQ_API_KEY，${rest.length} 筆未評分`;
+        }
+        await persist(job);
+      }
     }
 
     for (;;) {
       if (job.state !== 'running') return;
-      const todo = job.items.filter(it => it.score < 0 && !it.rechecked);
+      const todo = pending(job);
       if (!todo.length) break;
       // 單筆拆到底還是 -1 的會一直留在 todo，用 rechecked 標記避免無限迴圈
       const batch = todo.slice(0, BATCH_SIZE);
-      await scoreList(job, batch, deadline, cache);
+      try {
+        await scoreList(job, batch, deadline, cache);
+      } catch (e) {
+        // Groq 等 429 會超過時間上限：還沒評分的全部改送 Jev（Jev 本身失敗過就不再送回去）
+        if (!(e instanceof GroqError && e.kind === 'deadline' && engine === 'groq' && hasJevKey())) throw e;
+        const rest = pending(job);
+        job.fallbackNote = `Groq 限速等待會超過時間上限，${rest.length} 筆改送 Jev（單筆複查也要用 Groq，本次略過）`;
+        job.recheckDone = true;
+        await persist(job);
+        const r = await runJevScoring(job, rest, Math.max(deadline, Date.now()) + JEV_FALLBACK_GRACE_MS, cache);
+        if (!r.running) return;
+        if (r.error) throw r.error;
+        continue;
+      }
       for (const it of batch) if (it.score < 0) it.rechecked = true;
       assignGroups(job);
       const done = job.items.filter(it => it.score >= 0).length;
@@ -352,6 +394,7 @@ export async function runRankJob(id: string, opts: { maxMinutes?: number } = {})
         it.rechecked = true;
         if (got && got[0] > it.score) {
           it.score = got[0];
+          it.engine = 'groq';
           cache[scoreKey(job.topic, it.orgName, it.tenderName)] = got[0];
         }
         assignGroups(job);
@@ -402,12 +445,16 @@ export function rankSummary(job: RankJob): string {
   const perItem = c.scored ? (u.promptTokens + u.completionTokens) / Math.max(1, c.scored) : 250;
   const remainMin = Math.ceil(((c.total - c.scored) * perItem) / 8000);
   const jev = job.engine === 'jev';
+  const byJev = job.items.filter(it => it.score >= 0 && it.engine === 'jev').length;
+  const byGroq = job.items.filter(it => it.score >= 0 && it.engine === 'groq').length;
   return [
     `- 狀態：${job.state === 'running' ? '執行中' : job.state === 'done' ? '已完成' : job.state === 'paused' ? '已暫停' : '錯誤'}｜${job.message}`,
     `- 主題：${job.topic}｜必納關鍵字：${job.keywords.length ? job.keywords.join('、') : '（未給）'}`,
     `- 評分：${fmt(c.scored)} / ${fmt(c.total)} 筆${job.state === 'running' && c.total > c.scored && !jev ? `（免費額度下約還要 ${remainMin} 分鐘）` : ''}`,
     `- 分組：A 必納 ${fmt(c.A)}｜B AI 補抓 ${fmt(c.B)}｜C 低分 ${fmt(c.C)}`,
-    `- ${jev ? 'Jev（TypeSafe，逐案）' : 'Groq'}：${fmt(u.calls)} 次呼叫｜輸入 ${fmt(u.promptTokens)}／輸出 ${fmt(u.completionTokens)} token｜等待${jev ? '重試' : '限速'} ${Math.round(u.waitedMs / 1000)} 秒｜模型 ${job.model}`,
+    ...(job.fallbackNote ? [`- ⚠️ 改送另一個引擎：${job.fallbackNote}`] : []),
+    `- 實際給分引擎：Jev ${fmt(byJev)}｜Groq ${fmt(byGroq)}${c.scored > byJev + byGroq ? `｜舊版未記錄 ${fmt(c.scored - byJev - byGroq)}` : ''}`,
+    `- ${byJev && byGroq ? 'Jev＋Groq 合計' : jev ? 'Jev（TypeSafe，逐案）' : 'Groq'}：${fmt(u.calls)} 次呼叫｜輸入 ${fmt(u.promptTokens)}／輸出 ${fmt(u.completionTokens)} token｜等待${jev ? '重試' : '限速'} ${Math.round(u.waitedMs / 1000)} 秒｜模型 ${job.model}`,
     `- 資料範圍：${job.conditions}`,
   ].join('\n');
 }
