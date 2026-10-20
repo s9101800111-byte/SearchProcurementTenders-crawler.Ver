@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { envOrRegistry, GroqUsage } from './groq-client.js';
+import { logUsage } from './usage-log.js';
 
 /**
  * TypeSafe Jev（systemone）呼叫。只給 rank_by_topic engine="jev" 用。
@@ -60,11 +61,13 @@ export async function jevAsk(question: ReturnType<typeof jevQuestion>, orgName: 
 
   for (let attempt = 1; ; attempt++) {
     if (deadline && Date.now() > deadline) throw new JevError('已達本次執行時間上限', 'deadline');
+    const t0 = Date.now();
     const r = await axios.post(ENDPOINT, { model: JEV_MODEL, state, questions: { eng: question } }, {
       headers: { Authorization: `Bearer ${key}` },
       timeout: 60_000,
       validateStatus: () => true,
     }).catch((e: any) => ({ status: 0, data: { error: e.message } }));
+    logUsage({ engine: 'jev', model: JEV_MODEL, inputTokens: r.data?.usage?.input_tokens ?? 0, outputTokens: r.data?.usage?.output_tokens ?? 0, ms: Date.now() - t0, status: r.status, rateLimited: r.status === 429 });
 
     if (r.status === 200) {
       usage.calls++;

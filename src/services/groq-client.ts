@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { execFileSync } from 'node:child_process';
+import { logUsage } from './usage-log.js';
 
 /**
  * Groq（OpenAI 相容 API）呼叫。只給 rank_by_topic／expand_keywords 用，其他工具不依賴它。
@@ -68,6 +69,7 @@ export async function groqChat(prompt: string, usage: GroqUsage, opts: { maxToke
   if (!key) throw new GroqError(NO_KEY_MESSAGE, 'no-key');
 
   for (let attempt = 1; ; attempt++) {
+    const t0 = Date.now();
     const r = await axios.post(ENDPOINT, {
       model: GROQ_MODEL,
       temperature: 0,
@@ -79,6 +81,7 @@ export async function groqChat(prompt: string, usage: GroqUsage, opts: { maxToke
       timeout: 120_000,
       validateStatus: () => true,
     }).catch((e: any) => ({ status: 0, data: { error: e.message }, headers: {} as Record<string, string> }));
+    logUsage({ engine: 'groq', model: GROQ_MODEL, inputTokens: r.data?.usage?.prompt_tokens ?? 0, outputTokens: r.data?.usage?.completion_tokens ?? 0, ms: Date.now() - t0, status: r.status, rateLimited: r.status === 429 });
 
     if (r.status === 200) {
       usage.calls++;

@@ -454,7 +454,7 @@ export function rankSummary(job: RankJob): string {
     `- 分組：A 必納 ${fmt(c.A)}｜B AI 補抓 ${fmt(c.B)}｜C 低分 ${fmt(c.C)}`,
     ...(job.fallbackNote ? [`- ⚠️ 改送另一個引擎：${job.fallbackNote}`] : []),
     `- 實際給分引擎：Jev ${fmt(byJev)}｜Groq ${fmt(byGroq)}${c.scored > byJev + byGroq ? `｜舊版未記錄 ${fmt(c.scored - byJev - byGroq)}` : ''}`,
-    `- ${byJev && byGroq ? 'Jev＋Groq 合計' : jev ? 'Jev（TypeSafe，逐案）' : 'Groq'}：${fmt(u.calls)} 次呼叫｜輸入 ${fmt(u.promptTokens)}／輸出 ${fmt(u.completionTokens)} token｜等待${jev ? '重試' : '限速'} ${Math.round(u.waitedMs / 1000)} 秒｜模型 ${job.model}`,
+    `- ${(byJev && byGroq) || job.fallbackNote ? 'Jev＋Groq 合計' : jev ? 'Jev（TypeSafe，逐案）' : 'Groq'}：${fmt(u.calls)} 次呼叫｜輸入 ${fmt(u.promptTokens)}／輸出 ${fmt(u.completionTokens)} token｜等待${jev ? '重試' : '限速'} ${Math.round(u.waitedMs / 1000)} 秒｜模型 ${job.model}`,
     `- 資料範圍：${job.conditions}`,
   ].join('\n');
 }
