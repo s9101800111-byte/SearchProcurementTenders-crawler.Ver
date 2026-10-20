@@ -15,6 +15,8 @@ export interface UsageRecord {
   model: string;
   inputTokens: number;
   outputTokens: number;
+  /** Groq prompt caching 命中的輸入 token（usage.prompt_tokens_details.cached_tokens）；沒回報填 0 */
+  cachedTokens?: number;
   ms: number;
   /** HTTP 狀態碼，0＝連線失敗或逾時 */
   status: number;

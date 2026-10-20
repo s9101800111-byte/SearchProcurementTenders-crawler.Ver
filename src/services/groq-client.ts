@@ -81,7 +81,7 @@ export async function groqChat(prompt: string, usage: GroqUsage, opts: { maxToke
       timeout: 120_000,
       validateStatus: () => true,
     }).catch((e: any) => ({ status: 0, data: { error: e.message }, headers: {} as Record<string, string> }));
-    logUsage({ engine: 'groq', model: GROQ_MODEL, inputTokens: r.data?.usage?.prompt_tokens ?? 0, outputTokens: r.data?.usage?.completion_tokens ?? 0, ms: Date.now() - t0, status: r.status, rateLimited: r.status === 429 });
+    logUsage({ engine: 'groq', model: GROQ_MODEL, inputTokens: r.data?.usage?.prompt_tokens ?? 0, outputTokens: r.data?.usage?.completion_tokens ?? 0, cachedTokens: r.data?.usage?.prompt_tokens_details?.cached_tokens ?? 0, ms: Date.now() - t0, status: r.status, rateLimited: r.status === 429 });
 
     if (r.status === 200) {
       usage.calls++;

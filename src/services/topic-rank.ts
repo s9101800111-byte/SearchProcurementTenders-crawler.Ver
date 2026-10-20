@@ -184,14 +184,17 @@ export function compareRank(a: RankItem, b: RankItem): number {
 // ---------- Prompt ----------
 
 function scorePrompt(topic: string, list: RankItem[]): string {
+  // Groq prompt caching 只認逐字相同的前綴：固定指令放最前，主題（同一次 rank 內不變）其次，會變的放最後
   return `你是台灣政府採購案件分類員。判斷每一案是否屬於下列主題。
-
-主題：${topic}
 
 每案給一個分數：3=確定是、2=大概是、1=大概不是、0=確定不是。
 請依案件「實際要採購的標的」判斷：名稱裡出現工程或設備名詞，不代表採購的就是施工或設備本身；
 「委託…技術服務」「…規劃設計」「…監造」是服務，「…工程」「…修繕」「…維護工作」是作業本身。
-只輸出一個 JSON 整數陣列，長度必須剛好 ${list.length}，順序與輸入相同，不要任何其他文字。
+只輸出一個 JSON 整數陣列，順序與輸入相同，不要任何其他文字。
+
+主題：${topic}
+
+陣列長度必須剛好 ${list.length}。
 
 ${list.map((x, k) => `${k + 1}. [${x.orgName}] ${x.tenderName}`).join('\n')}`;
 }
